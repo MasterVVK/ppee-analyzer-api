@@ -391,16 +391,39 @@ class OllamaLLMProvider(LLMProvider):
                 search_query = parameters.get("search_query", "запрос")
                 full_prompt = full_prompt.replace("{query}", search_query)
 
+            # Оценка длины промпта (примерно 1 токен = 4 символа)
+            prompt_length = len(full_prompt) // 4
+            logger.info(f"Примерная длина промпта: ~{prompt_length} токенов")
+
+            # Получаем максимальное количество токенов для генерации
+            max_generation_tokens = int(parameters.get("max_tokens", 1000))
+
+            # Рассчитываем необходимый размер контекста
+            # Добавляем буфер 20% для безопасности
+            safety_buffer = 1.2
+            required_context = int((prompt_length + max_generation_tokens) * safety_buffer)
+
             # Получаем максимальный размер контекста для модели
-            context_length = self.get_context_length(model_name)
-            if context_length > 16384: context_length = 16384
+            model_max_context = self.get_context_length(model_name)
+            # Убрано искусственное ограничение в 16384 токена
+
+            # Используем меньшее из двух значений
+            actual_context_size = min(required_context, model_max_context)
+
+            # Минимальный размер контекста
+            MIN_CONTEXT_SIZE = 2048
+            actual_context_size = max(actual_context_size, MIN_CONTEXT_SIZE)
+
+            logger.info(f"Оптимизированный размер контекста: {actual_context_size} "
+                        f"(промпт: ~{prompt_length} + генерация: {max_generation_tokens} + буфер 20%)")
+            logger.info(f"Максимальный контекст модели: {model_max_context}")
 
             # Формируем параметры для запроса
             options = {
-                # Явно указываем размер контекста, чтобы предотвратить обрезание
-                "num_ctx": context_length,
+                # Используем оптимизированный размер контекста
+                "num_ctx": actual_context_size,
                 # Устанавливаем, сколько токенов нужно сохранить с начала промпта
-                "num_keep": context_length,
+                "num_keep": actual_context_size,
                 # Добавляем параметр для отключения режима think
                 "raw_prompt": True,  # Использовать промпт как есть, без обработки
                 "think": False  # Отключаем режим размышлений
@@ -414,12 +437,9 @@ class OllamaLLMProvider(LLMProvider):
             if "max_tokens" in parameters:
                 options["num_predict"] = int(parameters["max_tokens"])
 
-            # Оценка длины промпта (примерно 1 токен = 4 символа)
-            prompt_length = len(full_prompt) // 4
             logger.info(f"Отправка запроса к модели {model_name} через Ollama API")
-            logger.info(f"Примерная длина промпта: ~{prompt_length} токенов")
-            logger.info(
-                f"Указанный в запросе размер контекста: {options['num_ctx']}, сохраняемый контекст: {options['num_keep']}")
+            logger.info(f"Указанный в запросе размер контекста: {options['num_ctx']}, "
+                        f"сохраняемый контекст: {options['num_keep']}")
 
             # Формируем запрос к Ollama API
             payload = {

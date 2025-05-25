@@ -32,7 +32,8 @@ class OllamaEmbeddings(Embeddings):
             timeout: int = 60,
             normalize_embeddings: bool = True,
             check_availability: bool = True,
-            options: Dict[str, Any] = None  # Переопределение настроек
+            options: Dict[str, Any] = None,  # Переопределение настроек
+            keep_alive: str = "10s"  # Время хранения модели в памяти
     ):
         """
         Инициализирует класс для работы с эмбеддингами Ollama.
@@ -45,19 +46,21 @@ class OllamaEmbeddings(Embeddings):
             normalize_embeddings: Нормализовать ли векторы эмбеддингов
             check_availability: Проверять ли доступность модели при инициализации
             options: Дополнительные опции для запросов к Ollama API
+            keep_alive: Время хранения модели в памяти (например, "10s", "5m")
         """
         self.model_name = model_name
         self.base_url = base_url.rstrip('/')
         self.embed_batch_size = embed_batch_size
         self.timeout = timeout
         self.normalize_embeddings = normalize_embeddings
+        self.keep_alive = keep_alive
 
         # Создаем копию настроек по умолчанию и обновляем их переданными параметрами
         self.options = self.DEFAULT_OPTIONS.copy()
         if options:
             self.options.update(options)
 
-        logger.info(f"Инициализация OllamaEmbeddings с опциями: {self.options}")
+        logger.info(f"Инициализация OllamaEmbeddings с опциями: {self.options}, keep_alive: {self.keep_alive}")
 
         # Проверка доступности сервера и модели только если это требуется
         if check_availability:
@@ -138,10 +141,11 @@ class OllamaEmbeddings(Embeddings):
         payload = {
             "model": self.model_name,
             "input": text,  # Для /api/embed используется "input" вместо "prompt"
-            "options": self.options  # Используем единые опции
+            "options": self.options,  # Используем единые опции
+            "keep_alive": self.keep_alive  # Добавляем keep_alive
         }
 
-        logger.info(f"Отправка запроса для эмбеддинга с опциями: {self.options}")
+        logger.debug(f"Отправка запроса для эмбеддинга с keep_alive: {self.keep_alive}")
 
         try:
             response = requests.post(
@@ -157,7 +161,7 @@ class OllamaEmbeddings(Embeddings):
 
             if embeddings and len(embeddings) > 0:
                 embedding = embeddings[0]  # Берем первый эмбеддинг
-                logger.info(f"Получен эмбеддинг длиной {len(embedding)}")
+                logger.debug(f"Получен эмбеддинг длиной {len(embedding)}")
             else:
                 logger.error("Ollama API не вернул эмбеддинг")
                 return [0.0] * 1024  # Возвращаем нулевой вектор для bge-m3

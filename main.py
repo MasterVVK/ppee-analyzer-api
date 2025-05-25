@@ -41,6 +41,7 @@ indexing_semaphore = None  # Семафор для ограничения одн
 # Настройки очистки памяти
 CLEANUP_POLICY = os.environ.get("CLEANUP_POLICY", "aggressive")  # aggressive, moderate, disabled
 CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "30"))  # Задержка перед очисткой в секундах
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10s")  # Время хранения модели Ollama в памяти
 
 
 @asynccontextmanager
@@ -74,7 +75,8 @@ async def lifespan(app: FastAPI):
             embeddings_type="ollama",
             model_name="bge-m3",
             ollama_url="http://localhost:11434",
-            check_availability=False  # ВАЖНО: Отключаем проверку при старте
+            check_availability=False,  # ВАЖНО: Отключаем проверку при старте
+            ollama_keep_alive=OLLAMA_KEEP_ALIVE  # Время хранения модели в памяти из переменной окружения
         )
     )
 

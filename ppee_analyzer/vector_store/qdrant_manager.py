@@ -35,7 +35,8 @@ class QdrantManager:
         ollama_url: str = "http://localhost:11434",  # URL для Ollama
         create_collection: bool = True,
         check_availability: bool = True,
-        ollama_options: Dict[str, Any] = None  # Опции для Ollama API
+        ollama_options: Dict[str, Any] = None,  # Опции для Ollama API
+        ollama_keep_alive: str = "10s"  # Время хранения модели в памяти
     ):
         """
         Инициализирует менеджер Qdrant.
@@ -52,6 +53,7 @@ class QdrantManager:
             create_collection: Создавать коллекцию, если она не существует
             check_availability: Проверять ли доступность модели при инициализации
             ollama_options: Опции для Ollama API
+            ollama_keep_alive: Время хранения модели в памяти Ollama
         """
         self.collection_name = collection_name
         self.host = host
@@ -62,6 +64,7 @@ class QdrantManager:
         self.embeddings_type = embeddings_type
         self.ollama_url = ollama_url
         self.ollama_options = ollama_options
+        self.ollama_keep_alive = ollama_keep_alive
         self.check_availability = check_availability
         self._embeddings = None  # Ленивая инициализация
         self._embeddings_initialized = False
@@ -98,7 +101,8 @@ class QdrantManager:
                     base_url=self.ollama_url,
                     normalize_embeddings=True,
                     check_availability=self.check_availability,  # Используем переданный параметр
-                    options=options
+                    options=options,
+                    keep_alive=self.ollama_keep_alive  # Передаем keep_alive
                 )
             else:  # По умолчанию используем HuggingFace
                 logger.info(f"Используем эмбеддинги HuggingFace с моделью {self.model_name}")
