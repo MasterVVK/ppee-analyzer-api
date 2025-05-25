@@ -10,12 +10,17 @@ import os
 from contextlib import asynccontextmanager
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import gc
+import torch
 
 # Импорты из ppee_analyzer
 from ppee_analyzer.vector_store import QdrantManager, BGEReranker, OllamaEmbeddings
 from ppee_analyzer.semantic_chunker import SemanticChunker
 from ppee_analyzer.checklist import ChecklistAnalyzer
 from langchain_core.documents import Document
+
+# Импорты из локальных адаптеров
+from app.adapters.llm_adapter import OllamaLLMProvider
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -26,12 +31,16 @@ redis_client = None
 qdrant_manager = None
 reranker = None
 executor = ThreadPoolExecutor(max_workers=10)
+reranker_semaphore = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global redis_client, qdrant_manager, reranker
+    global redis_client, qdrant_manager, reranker, reranker_semaphore
+
+    # Инициализация семафора для ререйтера
+    reranker_semaphore = asyncio.Semaphore(1)
 
     # Инициализация Redis с асинхронным клиентом
     redis_client = await redis.from_url("redis://localhost:6379", decode_responses=True)
@@ -64,12 +73,22 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Не удалось инициализировать ререйтер: {e}")
         reranker = None
 
+    # Запускаем периодическую очистку памяти
+    cleanup_task = asyncio.create_task(periodic_cleanup())
+
     yield
 
     # Shutdown
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
     executor.shutdown(wait=True)
     if reranker:
         await loop.run_in_executor(executor, reranker.cleanup)
+        cleanup_gpu_memory()
     await redis_client.close()
 
 
@@ -109,6 +128,30 @@ class ProcessQueryRequest(BaseModel):
     context: str
     parameters: Dict[str, Any]
     query: Optional[str] = None
+
+
+# Функции для управления памятью
+def cleanup_gpu_memory():
+    """Освобождает память GPU"""
+    try:
+        # Явный вызов сборщика мусора Python
+        gc.collect()
+
+        # Если доступна CUDA, очищаем её кэш
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info("GPU память очищена")
+    except Exception as e:
+        logger.warning(f"Ошибка при очистке GPU памяти: {e}")
+
+
+async def periodic_cleanup():
+    """Периодически очищает неиспользуемую память"""
+    while True:
+        await asyncio.sleep(300)  # Каждые 5 минут
+        cleanup_gpu_memory()
+        logger.info("Выполнена периодическая очистка памяти")
 
 
 # Асинхронные вспомогательные функции
@@ -298,83 +341,101 @@ async def search(request: SearchRequest):
 
 def vector_search(application_id: str, query: str, limit: int,
                   use_reranker: bool, rerank_limit: Optional[int]) -> List[Dict]:
-    """Векторный поиск (синхронная функция для executor)"""
-    # Получаем больше результатов для ререйтинга
-    search_limit = rerank_limit if rerank_limit else (limit * 3 if use_reranker else limit)
+    """Векторный поиск с освобождением ресурсов"""
+    try:
+        # Получаем больше результатов для ререйтинга
+        search_limit = rerank_limit if rerank_limit else (limit * 3 if use_reranker else limit)
 
-    # Поиск
-    docs = qdrant_manager.search(
-        query=query,
-        filter_dict={"application_id": application_id},
-        k=search_limit
-    )
+        # Поиск
+        docs = qdrant_manager.search(
+            query=query,
+            filter_dict={"application_id": application_id},
+            k=search_limit
+        )
 
-    # Преобразуем результаты
-    results = []
-    for doc in docs:
-        results.append({
-            "text": doc.page_content,
-            "metadata": doc.metadata,
-            "score": doc.metadata.get('score', 0.0),
-            "search_type": "vector"
-        })
+        # Преобразуем результаты
+        results = []
+        for doc in docs:
+            results.append({
+                "text": doc.page_content,
+                "metadata": doc.metadata,
+                "score": doc.metadata.get('score', 0.0),
+                "search_type": "vector"
+            })
 
-    # Ререйтинг
-    if use_reranker and reranker and results:
-        results = reranker.rerank(query, results, top_k=limit, text_key="text")
+        # Ререйтинг
+        if use_reranker and reranker and results:
+            try:
+                results = reranker.rerank(query, results, top_k=limit, text_key="text")
+            finally:
+                # ВАЖНО: Освобождаем ресурсы после ререйтинга
+                cleanup_gpu_memory()
 
-    return results[:limit]
+        return results[:limit]
+    except Exception as e:
+        # При ошибке тоже освобождаем ресурсы
+        cleanup_gpu_memory()
+        raise
 
 
 def hybrid_search(application_id: str, query: str, limit: int,
                   vector_weight: float, text_weight: float, use_reranker: bool) -> List[Dict]:
-    """Гибридный поиск (синхронная функция для executor)"""
-    # Векторный поиск
-    vector_results = vector_search(application_id, query, limit * 2, False, None)
+    """Гибридный поиск с освобождением ресурсов"""
+    try:
+        # Векторный поиск (без ререйтинга на этом этапе)
+        vector_results = vector_search(application_id, query, limit * 2, False, None)
 
-    # Текстовый поиск через Qdrant
-    from qdrant_client.http import models
+        # Текстовый поиск через Qdrant
+        from qdrant_client.http import models
 
-    text_filter = models.Filter(
-        must=[
-            models.FieldCondition(
-                key="metadata.application_id",
-                match=models.MatchValue(value=application_id)
-            ),
-            models.FieldCondition(
-                key="page_content",
-                match=models.MatchText(text=query)
-            )
-        ]
-    )
+        text_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="metadata.application_id",
+                    match=models.MatchValue(value=application_id)
+                ),
+                models.FieldCondition(
+                    key="page_content",
+                    match=models.MatchText(text=query)
+                )
+            ]
+        )
 
-    text_results_raw = qdrant_manager.client.scroll(
-        collection_name=qdrant_manager.collection_name,
-        scroll_filter=text_filter,
-        limit=limit * 2,
-        with_payload=True,
-        with_vectors=False
-    )[0]
+        text_results_raw = qdrant_manager.client.scroll(
+            collection_name=qdrant_manager.collection_name,
+            scroll_filter=text_filter,
+            limit=limit * 2,
+            with_payload=True,
+            with_vectors=False
+        )[0]
 
-    # Преобразуем текстовые результаты
-    text_results = []
-    for i, point in enumerate(text_results_raw):
-        if hasattr(point, 'payload'):
-            text_results.append({
-                "text": point.payload.get("page_content", ""),
-                "metadata": point.payload.get("metadata", {}),
-                "score": 1.0 - (i * 0.05),
-                "search_type": "text"
-            })
+        # Преобразуем текстовые результаты
+        text_results = []
+        for i, point in enumerate(text_results_raw):
+            if hasattr(point, 'payload'):
+                text_results.append({
+                    "text": point.payload.get("page_content", ""),
+                    "metadata": point.payload.get("metadata", {}),
+                    "score": 1.0 - (i * 0.05),
+                    "search_type": "text"
+                })
 
-    # Объединяем результаты
-    combined = combine_results(vector_results, text_results, vector_weight, text_weight, limit)
+        # Объединяем результаты
+        combined = combine_results(vector_results, text_results, vector_weight, text_weight, limit)
 
-    # Ререйтинг
-    if use_reranker and reranker and combined:
-        combined = reranker.rerank(query, combined, top_k=limit, text_key="text")
+        # Ререйтинг
+        if use_reranker and reranker and combined:
+            try:
+                combined = reranker.rerank(query, combined, top_k=limit, text_key="text")
+            finally:
+                # ВАЖНО: Освобождаем ресурсы после ререйтинга
+                cleanup_gpu_memory()
 
-    return combined[:limit]
+        return combined[:limit]
+    except Exception as e:
+        # При ошибке тоже освобождаем ресурсы
+        cleanup_gpu_memory()
+        raise
 
 
 def combine_results(vector_results: List[Dict], text_results: List[Dict],
@@ -442,7 +503,7 @@ async def analyze_application(request: AnalyzeApplicationRequest):
 
 
 async def analyze_application_task(request: AnalyzeApplicationRequest):
-    """Асинхронная задача анализа"""
+    """Асинхронная задача анализа с умным поиском"""
     try:
         await update_task_status(request.task_id, "PROGRESS", 10, "prepare", "Инициализация анализа...")
 
@@ -512,7 +573,6 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                 # Преобразуем результаты в формат Document для LLM
                 search_documents = []
                 for res in search_results:
-                    from langchain_core.documents import Document
                     doc = Document(
                         page_content=res.get('text', ''),
                         metadata=res.get('metadata', {})
@@ -575,9 +635,16 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                         }
                     })
 
+                # После каждых 10 параметров освобождаем память
+                if (i + 1) % 10 == 0:
+                    cleanup_gpu_memory()
+
             except Exception as e:
                 logger.error(f"Ошибка при обработке параметра {item['id']}: {e}")
                 error_count += 1
+
+        # Освобождаем память после завершения анализа
+        cleanup_gpu_memory()
 
         # Завершение
         result = {
@@ -593,10 +660,11 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
 
     except Exception as e:
         logger.exception(f"Ошибка анализа: {e}")
+        cleanup_gpu_memory()  # Освобождаем память при ошибке
         await update_task_status(request.task_id, "FAILURE", 0, "error", str(e))
 
 
-# Добавляем вспомогательные функции для извлечения значений
+# Вспомогательные функции для анализа
 def extract_value_from_response(response: str, query: str) -> str:
     """Извлекает значение из ответа LLM"""
     lines = [line.strip() for line in response.split('\n') if line.strip()]
@@ -640,7 +708,6 @@ async def process_llm_query_async(model_name: str, prompt: str, context: str,
     loop = asyncio.get_event_loop()
 
     def _process():
-        from app.adapters.llm_adapter import OllamaLLMProvider
         llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
 
         return llm_provider.process_query(
@@ -680,7 +747,6 @@ async def get_llm_models():
         loop = asyncio.get_event_loop()
 
         def _get_models():
-            from app.adapters.llm_adapter import OllamaLLMProvider
             llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
             return llm_provider.get_available_models()
 
@@ -691,8 +757,6 @@ async def get_llm_models():
         logger.exception(f"Ошибка получения моделей: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# Добавляем в существующий main.py
 
 @app.get("/applications/{application_id}/stats")
 async def get_application_stats(application_id: str):
@@ -797,6 +861,32 @@ async def get_collection_info(collection_name: str):
     except Exception as e:
         logger.exception(f"Ошибка получения информации о коллекции: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cleanup")
+async def manual_cleanup():
+    """Ручная очистка памяти GPU"""
+    try:
+        cleanup_gpu_memory()
+
+        # Получаем информацию о памяти
+        memory_info = {}
+        if torch.cuda.is_available():
+            memory_info = {
+                "allocated": f"{torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB",
+                "reserved": f"{torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB",
+                "free": f"{(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1024 ** 3:.2f} GB"
+            }
+
+        return {
+            "status": "success",
+            "message": "Память очищена",
+            "memory_info": memory_info
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при очистке памяти: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
