@@ -3,11 +3,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import uuid
-import redis
+import redis.asyncio as redis
 import json
 import logging
 import os
 from contextlib import asynccontextmanager
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # Импорты из ppee_analyzer
 from ppee_analyzer.vector_store import QdrantManager, BGEReranker, OllamaEmbeddings
@@ -19,35 +21,44 @@ from langchain_core.documents import Document
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Redis клиент
-redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
-
-# Глобальные переменные для менеджеров
+# Глобальные переменные
+redis_client = None
 qdrant_manager = None
 reranker = None
+executor = ThreadPoolExecutor(max_workers=10)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global qdrant_manager, reranker
+    global redis_client, qdrant_manager, reranker
 
-    # Инициализация QdrantManager
-    qdrant_manager = QdrantManager(
-        collection_name="ppee_applications",
-        host="localhost",
-        port=6333,
-        embeddings_type="ollama",
-        model_name="bge-m3",
-        ollama_url="http://localhost:11434"
+    # Инициализация Redis с асинхронным клиентом
+    redis_client = await redis.from_url("redis://localhost:6379", decode_responses=True)
+
+    # Инициализация QdrantManager в отдельном потоке
+    loop = asyncio.get_event_loop()
+    qdrant_manager = await loop.run_in_executor(
+        executor,
+        lambda: QdrantManager(
+            collection_name="ppee_applications",
+            host="localhost",
+            port=6333,
+            embeddings_type="ollama",
+            model_name="bge-m3",
+            ollama_url="http://localhost:11434"
+        )
     )
 
     # Инициализация ререйтера (опционально)
     try:
-        reranker = BGEReranker(
-            model_name="BAAI/bge-reranker-v2-m3",
-            device="cuda",
-            min_vram_mb=500
+        reranker = await loop.run_in_executor(
+            executor,
+            lambda: BGEReranker(
+                model_name="BAAI/bge-reranker-v2-m3",
+                device="cuda",
+                min_vram_mb=500
+            )
         )
     except Exception as e:
         logger.warning(f"Не удалось инициализировать ререйтер: {e}")
@@ -56,14 +67,16 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    executor.shutdown(wait=True)
     if reranker:
-        reranker.cleanup()
+        await loop.run_in_executor(executor, reranker.cleanup)
+    await redis_client.close()
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-# Pydantic модели для запросов
+# Pydantic модели
 class IndexDocumentRequest(BaseModel):
     task_id: str
     application_id: str
@@ -98,10 +111,10 @@ class ProcessQueryRequest(BaseModel):
     query: Optional[str] = None
 
 
-# Вспомогательные функции
-def update_task_status(task_id: str, status: str, progress: int = 0,
-                       stage: str = "", message: str = "", result: Any = None):
-    """Обновляет статус задачи в Redis"""
+# Асинхронные вспомогательные функции
+async def update_task_status(task_id: str, status: str, progress: int = 0,
+                             stage: str = "", message: str = "", result: Any = None):
+    """Асинхронно обновляет статус задачи в Redis"""
     task_data = {
         "status": status,
         "progress": progress,
@@ -111,43 +124,48 @@ def update_task_status(task_id: str, status: str, progress: int = 0,
     if result is not None:
         task_data["result"] = result
 
-    redis_client.setex(f"task:{task_id}", 3600, json.dumps(task_data))
+    await redis_client.setex(f"task:{task_id}", 3600, json.dumps(task_data))
     logger.info(f"Task {task_id}: {status} - {progress}% [{stage}] {message}")
 
 
-def process_document_with_semantic_chunker(document_path: str, application_id: str) -> List[Document]:
-    """Обрабатывает документ с использованием семантического чанкера"""
-    chunker = SemanticChunker(use_gpu=True)
+async def process_document_with_semantic_chunker(document_path: str, application_id: str) -> List[Document]:
+    """Асинхронно обрабатывает документ с использованием семантического чанкера"""
+    loop = asyncio.get_event_loop()
 
-    # Извлекаем и обрабатываем чанки
-    chunks = chunker.extract_chunks(document_path)
-    processed_chunks = chunker.post_process_tables(chunks)
-    grouped_chunks = chunker.group_semantic_chunks(processed_chunks)
+    def _process():
+        chunker = SemanticChunker(use_gpu=True)
 
-    # Преобразуем в Document объекты
-    documents = []
-    document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
-    document_name = os.path.basename(document_path)
+        # Извлекаем и обрабатываем чанки
+        chunks = chunker.extract_chunks(document_path)
+        processed_chunks = chunker.post_process_tables(chunks)
+        grouped_chunks = chunker.group_semantic_chunks(processed_chunks)
 
-    for i, chunk in enumerate(grouped_chunks):
-        metadata = {
-            "application_id": application_id,
-            "document_id": document_id,
-            "document_name": document_name,
-            "content_type": chunk.get("type", "unknown"),
-            "chunk_index": i,
-            "section": chunk.get("heading", "Не определено"),
-        }
+        # Преобразуем в Document объекты
+        documents = []
+        document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
+        document_name = os.path.basename(document_path)
 
-        if chunk.get("page"):
-            metadata["page_number"] = chunk.get("page")
+        for i, chunk in enumerate(grouped_chunks):
+            metadata = {
+                "application_id": application_id,
+                "document_id": document_id,
+                "document_name": document_name,
+                "content_type": chunk.get("type", "unknown"),
+                "chunk_index": i,
+                "section": chunk.get("heading", "Не определено"),
+            }
 
-        documents.append(Document(
-            page_content=chunk.get("content", ""),
-            metadata=metadata
-        ))
+            if chunk.get("page"):
+                metadata["page_number"] = chunk.get("page")
 
-    return documents
+            documents.append(Document(
+                page_content=chunk.get("content", ""),
+                metadata=metadata
+            ))
+
+        return documents
+
+    return await loop.run_in_executor(executor, _process)
 
 
 # API endpoints
@@ -158,8 +176,8 @@ async def health_check():
 
 @app.get("/task/{task_id}/status")
 async def get_task_status(task_id: str):
-    """Получает статус задачи из Redis"""
-    task_data = redis_client.get(f"task:{task_id}")
+    """Асинхронно получает статус задачи из Redis"""
+    task_data = await redis_client.get(f"task:{task_id}")
     if not task_data:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -167,45 +185,49 @@ async def get_task_status(task_id: str):
 
 
 @app.post("/index")
-async def index_document(request: IndexDocumentRequest, background_tasks: BackgroundTasks):
-    """Индексирует документ в Qdrant"""
-    # Запускаем в фоне
-    background_tasks.add_task(index_document_task, request)
+async def index_document(request: IndexDocumentRequest):
+    """Запускает асинхронную индексацию документа"""
+    # Создаем задачу
+    asyncio.create_task(index_document_task(request))
     return {"status": "started", "task_id": request.task_id}
 
 
 async def index_document_task(request: IndexDocumentRequest):
-    """Фоновая задача индексации"""
+    """Асинхронная задача индексации"""
     try:
-        update_task_status(request.task_id, "PROGRESS", 5, "prepare", "Подготовка к индексации...")
+        await update_task_status(request.task_id, "PROGRESS", 5, "prepare", "Подготовка к индексации...")
 
         # Проверяем файл
         if not os.path.exists(request.document_path):
             raise FileNotFoundError(f"Файл не найден: {request.document_path}")
 
-        update_task_status(request.task_id, "PROGRESS", 20, "convert", "Обработка документа...")
+        await update_task_status(request.task_id, "PROGRESS", 20, "convert", "Обработка документа...")
 
         # Обрабатываем документ
-        chunks = process_document_with_semantic_chunker(request.document_path, request.application_id)
+        chunks = await process_document_with_semantic_chunker(request.document_path, request.application_id)
 
-        update_task_status(request.task_id, "PROGRESS", 50, "index", f"Индексация {len(chunks)} фрагментов...")
+        await update_task_status(request.task_id, "PROGRESS", 50, "index", f"Индексация {len(chunks)} фрагментов...")
 
         # Удаляем старые данные если нужно
         if request.delete_existing:
-            qdrant_manager.delete_application(request.application_id)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(executor, qdrant_manager.delete_application, request.application_id)
 
-        # Индексируем
+        # Индексируем пакетами асинхронно
         total_chunks = len(chunks)
         batch_size = 20
 
         for i in range(0, total_chunks, batch_size):
             end_idx = min(i + batch_size, total_chunks)
             batch = chunks[i:end_idx]
-            qdrant_manager.add_documents(batch)
+
+            # Добавляем документы в отдельном потоке
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(executor, qdrant_manager.add_documents, batch)
 
             progress = 50 + int(45 * (end_idx / total_chunks))
-            update_task_status(request.task_id, "PROGRESS", progress, "index",
-                               f"Индексация: {end_idx}/{total_chunks}...")
+            await update_task_status(request.task_id, "PROGRESS", progress, "index",
+                                     f"Индексация: {end_idx}/{total_chunks}...")
 
         # Успешное завершение
         result = {
@@ -215,24 +237,28 @@ async def index_document_task(request: IndexDocumentRequest):
             "status": "success"
         }
 
-        update_task_status(request.task_id, "SUCCESS", 100, "complete",
-                           "Индексация завершена", result)
+        await update_task_status(request.task_id, "SUCCESS", 100, "complete",
+                                 "Индексация завершена", result)
 
     except Exception as e:
         logger.exception(f"Ошибка индексации: {e}")
-        update_task_status(request.task_id, "FAILURE", 0, "error", str(e))
+        await update_task_status(request.task_id, "FAILURE", 0, "error", str(e))
 
 
 @app.post("/search")
 async def search(request: SearchRequest):
-    """Выполняет семантический поиск"""
+    """Асинхронно выполняет семантический поиск"""
     try:
-        # Выполняем поиск
+        loop = asyncio.get_event_loop()
+
+        # Выполняем поиск в отдельном потоке
         if request.use_smart_search:
-            # Умный поиск - выбор метода в зависимости от длины запроса
+            # Умный поиск
             if len(request.query) < request.hybrid_threshold:
                 # Гибридный поиск
-                results = hybrid_search(
+                results = await loop.run_in_executor(
+                    executor,
+                    hybrid_search,
                     request.application_id,
                     request.query,
                     request.limit,
@@ -242,7 +268,9 @@ async def search(request: SearchRequest):
                 )
             else:
                 # Векторный поиск
-                results = vector_search(
+                results = await loop.run_in_executor(
+                    executor,
+                    vector_search,
                     request.application_id,
                     request.query,
                     request.limit,
@@ -251,7 +279,9 @@ async def search(request: SearchRequest):
                 )
         else:
             # Обычный векторный поиск
-            results = vector_search(
+            results = await loop.run_in_executor(
+                executor,
+                vector_search,
                 request.application_id,
                 request.query,
                 request.limit,
@@ -268,7 +298,7 @@ async def search(request: SearchRequest):
 
 def vector_search(application_id: str, query: str, limit: int,
                   use_reranker: bool, rerank_limit: Optional[int]) -> List[Dict]:
-    """Векторный поиск"""
+    """Векторный поиск (синхронная функция для executor)"""
     # Получаем больше результатов для ререйтинга
     search_limit = rerank_limit if rerank_limit else (limit * 3 if use_reranker else limit)
 
@@ -298,7 +328,7 @@ def vector_search(application_id: str, query: str, limit: int,
 
 def hybrid_search(application_id: str, query: str, limit: int,
                   vector_weight: float, text_weight: float, use_reranker: bool) -> List[Dict]:
-    """Гибридный поиск"""
+    """Гибридный поиск (синхронная функция для executor)"""
     # Векторный поиск
     vector_results = vector_search(application_id, query, limit * 2, False, None)
 
@@ -405,17 +435,18 @@ def get_document_key(doc: Dict) -> str:
 
 
 @app.post("/analyze")
-async def analyze_application(request: AnalyzeApplicationRequest, background_tasks: BackgroundTasks):
-    """Анализирует заявку по чек-листам"""
-    background_tasks.add_task(analyze_application_task, request)
+async def analyze_application(request: AnalyzeApplicationRequest):
+    """Запускает асинхронный анализ заявки"""
+    asyncio.create_task(analyze_application_task(request))
     return {"status": "started", "task_id": request.task_id}
 
 
 async def analyze_application_task(request: AnalyzeApplicationRequest):
-    """Фоновая задача анализа"""
+    """Асинхронная задача анализа"""
     try:
-        update_task_status(request.task_id, "PROGRESS", 10, "prepare", "Инициализация анализа...")
+        await update_task_status(request.task_id, "PROGRESS", 10, "prepare", "Инициализация анализа...")
 
+        loop = asyncio.get_event_loop()
         analyzer = ChecklistAnalyzer(qdrant_manager)
         processed_count = 0
         error_count = 0
@@ -426,31 +457,30 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
         for i, item in enumerate(request.checklist_items):
             try:
                 progress = 15 + int(75 * (i / total_items))
-                update_task_status(request.task_id, "PROGRESS", progress, "analyze",
-                                   f"Анализ параметра {i + 1}/{total_items}: {item['name']}")
+                await update_task_status(request.task_id, "PROGRESS", progress, "analyze",
+                                         f"Анализ параметра {i + 1}/{total_items}: {item['name']}")
 
-                # Поиск
-                search_results = qdrant_manager.search(
-                    query=item['search_query'],
-                    filter_dict={"application_id": request.application_id},
-                    k=item.get('search_limit', 3)
+                # Поиск в отдельном потоке
+                search_results = await loop.run_in_executor(
+                    executor,
+                    qdrant_manager.search,
+                    item['search_query'],
+                    {"application_id": request.application_id},
+                    item.get('search_limit', 3)
                 )
 
                 # Обработка через LLM
                 if search_results:
-                    from app.adapters.llm_adapter import OllamaLLMProvider
-                    llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
-
                     # Форматируем контекст
                     context = "\n\n".join([doc.page_content for doc in search_results])
 
-                    # Вызываем LLM
-                    llm_response = llm_provider.process_query(
-                        model_name=item['llm_model'],
-                        prompt=item['llm_prompt_template'],
-                        context=context,
-                        parameters=request.llm_params,
-                        query=item['search_query']
+                    # Вызываем LLM асинхронно
+                    llm_response = await process_llm_query_async(
+                        item['llm_model'],
+                        item['llm_prompt_template'],
+                        context,
+                        request.llm_params,
+                        item['search_query']
                     )
 
                     results.append({
@@ -482,27 +512,44 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
             "results": results
         }
 
-        update_task_status(request.task_id, "SUCCESS", 100, "complete",
-                           "Анализ завершен", result)
+        await update_task_status(request.task_id, "SUCCESS", 100, "complete",
+                                 "Анализ завершен", result)
 
     except Exception as e:
         logger.exception(f"Ошибка анализа: {e}")
-        update_task_status(request.task_id, "FAILURE", 0, "error", str(e))
+        await update_task_status(request.task_id, "FAILURE", 0, "error", str(e))
+
+
+async def process_llm_query_async(model_name: str, prompt: str, context: str,
+                                  parameters: Dict[str, Any], query: Optional[str] = None):
+    """Асинхронная обработка запроса через LLM"""
+    loop = asyncio.get_event_loop()
+
+    def _process():
+        from app.adapters.llm_adapter import OllamaLLMProvider
+        llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
+
+        return llm_provider.process_query(
+            model_name=model_name,
+            prompt=prompt,
+            context=context,
+            parameters=parameters,
+            query=query
+        )
+
+    return await loop.run_in_executor(executor, _process)
 
 
 @app.post("/llm/process")
 async def process_llm_query(request: ProcessQueryRequest):
-    """Обрабатывает запрос через LLM"""
+    """Асинхронно обрабатывает запрос через LLM"""
     try:
-        from app.adapters.llm_adapter import OllamaLLMProvider
-        llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
-
-        response = llm_provider.process_query(
-            model_name=request.model_name,
-            prompt=request.prompt,
-            context=request.context,
-            parameters=request.parameters,
-            query=request.query
+        response = await process_llm_query_async(
+            request.model_name,
+            request.prompt,
+            request.context,
+            request.parameters,
+            request.query
         )
 
         return {"status": "success", "response": response}
@@ -514,12 +561,18 @@ async def process_llm_query(request: ProcessQueryRequest):
 
 @app.get("/llm/models")
 async def get_llm_models():
-    """Получает список доступных LLM моделей"""
+    """Асинхронно получает список доступных LLM моделей"""
     try:
-        from app.adapters.llm_adapter import OllamaLLMProvider
-        llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
-        models = llm_provider.get_available_models()
+        loop = asyncio.get_event_loop()
+
+        def _get_models():
+            from app.adapters.llm_adapter import OllamaLLMProvider
+            llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
+            return llm_provider.get_available_models()
+
+        models = await loop.run_in_executor(executor, _get_models)
         return {"status": "success", "models": models}
+
     except Exception as e:
         logger.exception(f"Ошибка получения моделей: {e}")
         raise HTTPException(status_code=500, detail=str(e))
