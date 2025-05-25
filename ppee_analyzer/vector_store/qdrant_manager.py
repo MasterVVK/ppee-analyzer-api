@@ -362,3 +362,39 @@ class QdrantManager:
             "applications": list(applications),
             "documents": list(documents)
         }
+
+    def cleanup(self):
+        """
+        Освобождает ресурсы, выгружая модели из памяти.
+        Используется для освобождения VRAM после операций.
+        """
+        try:
+            logger.info("Очистка ресурсов QdrantManager...")
+
+            # Сбрасываем эмбеддинги
+            if self._embeddings_initialized:
+                self._embeddings = None
+                self._embeddings_initialized = False
+                logger.info("Эмбеддинги выгружены")
+
+            # Сбрасываем векторное хранилище
+            if self._vector_store is not None:
+                self._vector_store = None
+                logger.info("Векторное хранилище сброшено")
+
+            # Принудительная сборка мусора
+            import gc
+            gc.collect()
+
+            # Очистка CUDA кэша если используется GPU
+            if self.device == "cuda":
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        logger.info("CUDA кэш очищен")
+                except Exception as e:
+                    logger.warning(f"Не удалось очистить CUDA кэш: {e}")
+
+        except Exception as e:
+            logger.error(f"Ошибка при очистке ресурсов QdrantManager: {e}")

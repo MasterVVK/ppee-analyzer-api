@@ -714,3 +714,33 @@ class SemanticChunker:
             document_path=pdf_path,
             statistics=statistics
         )
+
+    def cleanup(self):
+        """
+        Освобождает ресурсы, выгружая Docling конвертер из памяти.
+        """
+        try:
+            logger.info("Очистка ресурсов SemanticChunker...")
+
+            # Освобождаем конвертер
+            if self._converter_initialized:
+                self._converter = None
+                self._converter_initialized = False
+                logger.info("Docling конвертер выгружен")
+
+            # Принудительная сборка мусора
+            import gc
+            gc.collect()
+
+            # Очистка CUDA кэша если используется GPU
+            if self.use_gpu:
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        logger.info("CUDA кэш очищен после работы Docling")
+                except Exception as e:
+                    logger.warning(f"Не удалось очистить CUDA кэш: {e}")
+
+        except Exception as e:
+            logger.error(f"Ошибка при очистке ресурсов SemanticChunker: {e}")

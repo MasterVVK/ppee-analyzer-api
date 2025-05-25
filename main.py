@@ -33,15 +33,32 @@ reranker = None
 executor = ThreadPoolExecutor(max_workers=10)
 reranker_semaphore = None
 reranker_initialized = False  # Флаг инициализации ререйтера
+active_indexing_tasks = 0  # Счетчик активных задач индексации
+indexing_lock = None  # Блокировка для счетчика
+indexing_queue = None  # Очередь для задач индексации
+indexing_semaphore = None  # Семафор для ограничения одной индексации
+
+# Настройки очистки памяти
+CLEANUP_POLICY = os.environ.get("CLEANUP_POLICY", "aggressive")  # aggressive, moderate, disabled
+CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "30"))  # Задержка перед очисткой в секундах
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global redis_client, qdrant_manager, reranker_semaphore
+    global redis_client, qdrant_manager, reranker_semaphore, indexing_lock, indexing_queue, indexing_semaphore
 
     # Инициализация семафора для ререйтера
     reranker_semaphore = asyncio.Semaphore(1)
+
+    # Инициализация блокировки для счетчика индексаций
+    indexing_lock = asyncio.Lock()
+
+    # Инициализация очереди для задач индексации
+    indexing_queue = asyncio.Queue()
+
+    # Семафор для ограничения одной индексации за раз
+    indexing_semaphore = asyncio.Semaphore(1)
 
     # Инициализация Redis с асинхронным клиентом
     redis_client = await redis.from_url("redis://localhost:6379", decode_responses=True)
@@ -67,12 +84,20 @@ async def lifespan(app: FastAPI):
     # Запускаем периодическую очистку памяти
     cleanup_task = asyncio.create_task(periodic_cleanup())
 
+    # Запускаем обработчик очереди индексации
+    indexing_worker_task = asyncio.create_task(indexing_queue_worker())
+
     yield
 
     # Shutdown
     cleanup_task.cancel()
+    indexing_worker_task.cancel()
     try:
         await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await indexing_worker_task
     except asyncio.CancelledError:
         pass
 
@@ -145,6 +170,103 @@ async def periodic_cleanup():
         logger.info("Выполнена периодическая очистка памяти")
 
 
+async def indexing_queue_worker():
+    """Воркер для обработки очереди индексации - обрабатывает только одну задачу за раз"""
+    logger.info("Запущен обработчик очереди индексации")
+
+    while True:
+        try:
+            # Ждем задачу из очереди
+            request = await indexing_queue.get()
+
+            # Обрабатываем задачу с семафором (только одна за раз)
+            async with indexing_semaphore:
+                logger.info(f"Начало обработки задачи индексации: {request.task_id}")
+                await index_document_task_worker(request)
+                logger.info(f"Завершена обработка задачи индексации: {request.task_id}")
+
+            # Помечаем задачу как выполненную
+            indexing_queue.task_done()
+
+        except asyncio.CancelledError:
+            logger.info("Остановка обработчика очереди индексации")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в обработчике очереди индексации: {e}")
+            await asyncio.sleep(1)  # Небольшая пауза при ошибке
+    """Периодически очищает неиспользуемую память"""
+    while True:
+        await asyncio.sleep(300)  # Каждые 5 минут
+        cleanup_gpu_memory()
+        logger.info("Выполнена периодическая очистка памяти")
+
+
+async def cleanup_after_indexing():
+    """Полная очистка памяти после индексации, включая выгрузку моделей"""
+    global qdrant_manager, active_indexing_tasks
+
+    try:
+        # Проверяем политику очистки
+        if CLEANUP_POLICY == "disabled":
+            logger.info("Очистка памяти отключена политикой CLEANUP_POLICY=disabled")
+            return
+
+        # Проверяем, есть ли еще активные задачи индексации или задачи в очереди
+        async with indexing_lock:
+            queue_size = indexing_queue.qsize() if indexing_queue else 0
+            if active_indexing_tasks > 0 or queue_size > 0:
+                logger.info(
+                    f"Пропускаем очистку, есть активные задачи: {active_indexing_tasks}, в очереди: {queue_size}")
+                return
+
+        # Ждем перед очисткой (на случай если сразу начнется новая индексация)
+        if CLEANUP_DELAY > 0:
+            logger.info(f"Ожидание {CLEANUP_DELAY} секунд перед очисткой памяти...")
+            await asyncio.sleep(CLEANUP_DELAY)
+
+            # Проверяем еще раз после задержки
+            async with indexing_lock:
+                queue_size = indexing_queue.qsize() if indexing_queue else 0
+                if active_indexing_tasks > 0 or queue_size > 0:
+                    logger.info(
+                        f"Очистка отменена, появились новые задачи: активных={active_indexing_tasks}, в очереди={queue_size}")
+                    return
+
+        logger.info("Начало полной очистки памяти после индексации...")
+
+        if CLEANUP_POLICY == "aggressive":
+            # Агрессивная очистка - выгружаем все
+            if qdrant_manager and hasattr(qdrant_manager,
+                                          '_embeddings_initialized') and qdrant_manager._embeddings_initialized:
+                # Сбрасываем эмбеддинги
+                qdrant_manager._embeddings = None
+                qdrant_manager._embeddings_initialized = False
+                qdrant_manager._vector_store = None
+                logger.info("Эмбеддинги выгружены из памяти (aggressive)")
+        elif CLEANUP_POLICY == "moderate":
+            # Умеренная очистка - только очищаем кэши, но оставляем модели загруженными
+            logger.info("Умеренная очистка памяти (moderate) - модели остаются загруженными")
+
+        # Очищаем память Python
+        import gc
+        gc.collect()
+
+        # Очищаем CUDA кэш
+        cleanup_gpu_memory()
+
+        # Дополнительная пауза для освобождения ресурсов
+        await asyncio.sleep(1)
+
+        # Проверяем освобожденную память
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024 ** 3
+            reserved = torch.cuda.memory_reserved() / 1024 ** 3
+            logger.info(f"После очистки: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
+
+    except Exception as e:
+        logger.error(f"Ошибка при полной очистке памяти: {e}")
+
+
 # Функция для ленивой инициализации ререйтера
 async def get_reranker():
     """Ленивая инициализация ререйтера при первом использовании"""
@@ -196,42 +318,178 @@ async def process_document_with_semantic_chunker(document_path: str, application
     loop = asyncio.get_event_loop()
 
     def _process():
-        chunker = SemanticChunker(use_gpu=True)
+        chunker = None
+        try:
+            # Перед созданием chunker'а очищаем память и устанавливаем устройство
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.set_device(0)  # Явно устанавливаем устройство
 
-        # Извлекаем и обрабатываем чанки
-        chunks = chunker.extract_chunks(document_path)
-        processed_chunks = chunker.post_process_tables(chunks)
-        grouped_chunks = chunker.group_semantic_chunks(processed_chunks)
+            chunker = SemanticChunker(use_gpu=True)
 
-        # Преобразуем в Document объекты
-        documents = []
-        document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
-        document_name = os.path.basename(document_path)
+            # Извлекаем и обрабатываем чанки
+            chunks = chunker.extract_chunks(document_path)
+            processed_chunks = chunker.post_process_tables(chunks)
+            grouped_chunks = chunker.group_semantic_chunks(processed_chunks)
 
-        for i, chunk in enumerate(grouped_chunks):
-            metadata = {
-                "application_id": application_id,
-                "document_id": document_id,
-                "document_name": document_name,
-                "content_type": chunk.get("type", "unknown"),
-                "chunk_index": i,
-                "section": chunk.get("heading", "Не определено"),
-            }
+            # Преобразуем в Document объекты
+            documents = []
+            document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
+            document_name = os.path.basename(document_path)
 
-            if chunk.get("page"):
-                metadata["page_number"] = chunk.get("page")
+            for i, chunk in enumerate(grouped_chunks):
+                metadata = {
+                    "application_id": application_id,
+                    "document_id": document_id,
+                    "document_name": document_name,
+                    "content_type": chunk.get("type", "unknown"),
+                    "chunk_index": i,
+                    "section": chunk.get("heading", "Не определено"),
+                }
 
-            documents.append(Document(
-                page_content=chunk.get("content", ""),
-                metadata=metadata
-            ))
+                if chunk.get("page"):
+                    metadata["page_number"] = chunk.get("page")
 
-        return documents
+                documents.append(Document(
+                    page_content=chunk.get("content", ""),
+                    metadata=metadata
+                ))
+
+            return documents
+        except RuntimeError as e:
+            if "meta tensor" in str(e):
+                logger.error(f"Ошибка meta tensor, попытка использовать CPU: {str(e)}")
+                # Пересоздаем chunker с CPU
+                if chunker:
+                    if hasattr(chunker, '_converter'):
+                        chunker._converter = None
+                        chunker._converter_initialized = False
+                    del chunker
+
+                # Повторная попытка с CPU
+                chunker = SemanticChunker(use_gpu=False)
+                chunks = chunker.extract_chunks(document_path)
+                processed_chunks = chunker.post_process_tables(chunks)
+                grouped_chunks = chunker.group_semantic_chunks(processed_chunks)
+
+                # Преобразуем в Document объекты
+                documents = []
+                document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
+                document_name = os.path.basename(document_path)
+
+                for i, chunk in enumerate(grouped_chunks):
+                    metadata = {
+                        "application_id": application_id,
+                        "document_id": document_id,
+                        "document_name": document_name,
+                        "content_type": chunk.get("type", "unknown"),
+                        "chunk_index": i,
+                        "section": chunk.get("heading", "Не определено"),
+                    }
+
+                    if chunk.get("page"):
+                        metadata["page_number"] = chunk.get("page")
+
+                    documents.append(Document(
+                        page_content=chunk.get("content", ""),
+                        metadata=metadata
+                    ))
+
+                return documents
+            else:
+                raise
+        finally:
+            # Очищаем chunker после использования
+            if chunker:
+                # Освобождаем docling converter
+                if hasattr(chunker, '_converter'):
+                    chunker._converter = None
+                    chunker._converter_initialized = False
+                del chunker
+
+                # Принудительная сборка мусора
+                import gc
+                gc.collect()
+
+                logger.info("SemanticChunker освобожден из памяти")
 
     return await loop.run_in_executor(executor, _process)
 
 
 # API endpoints
+@app.get("/system/status")
+async def get_system_status():
+    """Получает текущий статус системы"""
+    try:
+        status = {
+            "active_indexing_tasks": active_indexing_tasks,
+            "embeddings_loaded": False,
+            "reranker_loaded": reranker is not None,
+            "memory_info": {},
+            "indexing_queue_size": indexing_queue.qsize() if indexing_queue else 0
+        }
+
+        # Проверяем загружены ли эмбеддинги
+        if qdrant_manager and hasattr(qdrant_manager, '_embeddings_initialized'):
+            status["embeddings_loaded"] = qdrant_manager._embeddings_initialized
+
+        # Получаем информацию о памяти
+        if torch.cuda.is_available():
+            status["memory_info"] = {
+                "allocated": f"{torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB",
+                "reserved": f"{torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB",
+                "free": f"{(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1024 ** 3:.2f} GB"
+            }
+
+        return {"status": "success", "system": status}
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении статуса системы: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/queue/status")
+async def get_queue_status():
+    """Получает статус очереди индексации"""
+    try:
+        queue_size = indexing_queue.qsize() if indexing_queue else 0
+
+        # Получаем список задач в очереди
+        queue_tasks = []
+        if queue_size > 0:
+            # Примечание: это приблизительная информация, так как очередь может измениться
+            temp_list = []
+            for _ in range(queue_size):
+                try:
+                    item = indexing_queue.get_nowait()
+                    temp_list.append(item)
+                    queue_tasks.append({
+                        "task_id": item.task_id,
+                        "application_id": item.application_id,
+                        "document_path": os.path.basename(item.document_path)
+                    })
+                except asyncio.QueueEmpty:
+                    break
+
+            # Возвращаем элементы обратно в очередь
+            for item in temp_list:
+                await indexing_queue.put(item)
+
+        return {
+            "status": "success",
+            "queue": {
+                "size": queue_size,
+                "active_task": active_indexing_tasks > 0,
+                "tasks": queue_tasks
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении статуса очереди: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
@@ -250,13 +508,29 @@ async def get_task_status(task_id: str):
 @app.post("/index")
 async def index_document(request: IndexDocumentRequest):
     """Запускает асинхронную индексацию документа"""
-    # Создаем задачу
-    asyncio.create_task(index_document_task(request))
-    return {"status": "started", "task_id": request.task_id}
+    # Добавляем задачу в очередь
+    await indexing_queue.put(request)
+
+    # Обновляем статус задачи
+    await update_task_status(request.task_id, "QUEUED", 0, "queue",
+                             f"Задача добавлена в очередь. Позиция: {indexing_queue.qsize()}")
+
+    return {
+        "status": "queued",
+        "task_id": request.task_id,
+        "queue_position": indexing_queue.qsize()
+    }
 
 
-async def index_document_task(request: IndexDocumentRequest):
-    """Асинхронная задача индексации"""
+async def index_document_task_worker(request: IndexDocumentRequest):
+    """Воркер для выполнения индексации - вызывается из очереди"""
+    global active_indexing_tasks
+
+    # Увеличиваем счетчик активных задач
+    async with indexing_lock:
+        active_indexing_tasks += 1
+        logger.info(f"Начата индексация. Активных задач: {active_indexing_tasks}")
+
     try:
         await update_task_status(request.task_id, "PROGRESS", 5, "prepare", "Подготовка к индексации...")
 
@@ -306,6 +580,20 @@ async def index_document_task(request: IndexDocumentRequest):
     except Exception as e:
         logger.exception(f"Ошибка индексации: {e}")
         await update_task_status(request.task_id, "FAILURE", 0, "error", str(e))
+    finally:
+        # Уменьшаем счетчик активных задач
+        async with indexing_lock:
+            active_indexing_tasks -= 1
+            logger.info(f"Индексация завершена. Активных задач: {active_indexing_tasks}")
+
+        # Очищаем память только если это была последняя задача
+        await cleanup_after_indexing()
+
+
+async def index_document_task(request: IndexDocumentRequest):
+    """Устаревшая функция для совместимости"""
+    logger.warning("Использование устаревшей функции index_document_task")
+    await index_document_task_worker(request)
 
 
 @app.post("/search")
@@ -959,7 +1247,7 @@ async def preload_models():
 @app.post("/unload-models")
 async def unload_models():
     """Выгрузка моделей из памяти для освобождения VRAM"""
-    global reranker, reranker_initialized
+    global reranker, reranker_initialized, qdrant_manager
 
     try:
         loop = asyncio.get_event_loop()
@@ -969,6 +1257,12 @@ async def unload_models():
             await loop.run_in_executor(executor, reranker.cleanup)
             reranker = None
             reranker_initialized = False
+            logger.info("Ререйтер выгружен")
+
+        # Выгружаем эмбеддинги из QdrantManager
+        if qdrant_manager:
+            await loop.run_in_executor(executor, qdrant_manager.cleanup)
+            logger.info("QdrantManager очищен")
 
         # Очищаем память
         cleanup_gpu_memory()
