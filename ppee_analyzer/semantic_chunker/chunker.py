@@ -23,7 +23,7 @@ from .utils import (
 
 # Импорты для интеграции с ppee_analyzer
 from langchain_core.documents import Document
-from ..document_processor.splitter import PPEEDocumentSplitter
+#from ..document_processor.splitter import PPEEDocumentSplitter
 
 # Настройка логирования
 logger = logging.getLogger(__name__)
