@@ -454,41 +454,112 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
 
         results = []
 
+        # Получаем настройки умного поиска из llm_params
+        use_smart_search = request.llm_params.get('use_smart_search', True)
+        hybrid_threshold = request.llm_params.get('hybrid_threshold', 10)
+
         for i, item in enumerate(request.checklist_items):
             try:
                 progress = 15 + int(75 * (i / total_items))
                 await update_task_status(request.task_id, "PROGRESS", progress, "analyze",
                                          f"Анализ параметра {i + 1}/{total_items}: {item['name']}")
 
-                # Поиск в отдельном потоке
-                search_results = await loop.run_in_executor(
-                    executor,
-                    qdrant_manager.search,
-                    item['search_query'],
-                    {"application_id": request.application_id},
-                    item.get('search_limit', 3)
-                )
+                # Определяем метод поиска на основе длины запроса
+                query = item['search_query']
+                search_method = "vector"
+
+                if use_smart_search:
+                    if len(query) < hybrid_threshold:
+                        logger.info(f"Используем гибридный поиск для '{query}' (<{hybrid_threshold} символов)")
+                        search_method = "hybrid"
+
+                        # Выполняем гибридный поиск
+                        search_results = await loop.run_in_executor(
+                            executor,
+                            hybrid_search,
+                            request.application_id,
+                            query,
+                            item.get('search_limit', 3),
+                            0.5,  # vector_weight
+                            0.5,  # text_weight
+                            item.get('use_reranker', False)
+                        )
+                    else:
+                        logger.info(f"Используем векторный поиск для '{query}' (>={hybrid_threshold} символов)")
+
+                        # Выполняем векторный поиск
+                        search_results = await loop.run_in_executor(
+                            executor,
+                            vector_search,
+                            request.application_id,
+                            query,
+                            item.get('search_limit', 3),
+                            item.get('use_reranker', False),
+                            item.get('rerank_limit', 10) if item.get('use_reranker', False) else None
+                        )
+                else:
+                    # Обычный векторный поиск
+                    search_results = await loop.run_in_executor(
+                        executor,
+                        vector_search,
+                        request.application_id,
+                        query,
+                        item.get('search_limit', 3),
+                        item.get('use_reranker', False),
+                        item.get('rerank_limit', 10) if item.get('use_reranker', False) else None
+                    )
+
+                # Преобразуем результаты в формат Document для LLM
+                search_documents = []
+                for res in search_results:
+                    from langchain_core.documents import Document
+                    doc = Document(
+                        page_content=res.get('text', ''),
+                        metadata=res.get('metadata', {})
+                    )
+                    search_documents.append(doc)
 
                 # Обработка через LLM
-                if search_results:
+                if search_documents:
                     # Форматируем контекст
-                    context = "\n\n".join([doc.page_content for doc in search_results])
+                    context = "\n\n".join([doc.page_content for doc in search_documents])
 
                     # Вызываем LLM асинхронно
                     llm_response = await process_llm_query_async(
                         item['llm_model'],
                         item['llm_prompt_template'],
                         context,
-                        request.llm_params,
-                        item['search_query']
+                        {
+                            'temperature': item.get('llm_temperature', 0.1),
+                            'max_tokens': item.get('llm_max_tokens', 1000),
+                            'search_query': query
+                        },
+                        query
                     )
+
+                    # Извлекаем значение
+                    value = extract_value_from_response(llm_response, query)
+                    confidence = calculate_confidence(llm_response)
 
                     results.append({
                         "parameter_id": item['id'],
-                        "value": llm_response,
-                        "confidence": 0.8,
-                        "search_results": [{"text": doc.page_content, "metadata": doc.metadata}
-                                           for doc in search_results]
+                        "value": value,
+                        "confidence": confidence,
+                        "search_results": [{"text": res.get('text', ''),
+                                            "metadata": res.get('metadata', {}),
+                                            "score": res.get('score', 0.0)}
+                                           for res in search_results],
+                        "search_method": search_method,
+                        "llm_request": {
+                            'prompt_template': item['llm_prompt_template'],
+                            'query': query,
+                            'context': context,
+                            'model': item['llm_model'],
+                            'temperature': item.get('llm_temperature', 0.1),
+                            'max_tokens': item.get('llm_max_tokens', 1000),
+                            'response': llm_response,
+                            'search_method': search_method
+                        }
                     })
                     processed_count += 1
                 else:
@@ -496,7 +567,12 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                         "parameter_id": item['id'],
                         "value": "Информация не найдена",
                         "confidence": 0.0,
-                        "search_results": []
+                        "search_results": [],
+                        "search_method": search_method,
+                        "llm_request": {
+                            'error': 'Не найдено результатов поиска',
+                            'search_method': search_method
+                        }
                     })
 
             except Exception as e:
@@ -518,6 +594,44 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
     except Exception as e:
         logger.exception(f"Ошибка анализа: {e}")
         await update_task_status(request.task_id, "FAILURE", 0, "error", str(e))
+
+
+# Добавляем вспомогательные функции для извлечения значений
+def extract_value_from_response(response: str, query: str) -> str:
+    """Извлекает значение из ответа LLM"""
+    lines = [line.strip() for line in response.split('\n') if line.strip()]
+
+    # Ищем строку с результатом
+    for line in lines:
+        if line.startswith("РЕЗУЛЬТАТ:"):
+            return line.replace("РЕЗУЛЬТАТ:", "").strip()
+
+    # Ищем строку с двоеточием
+    for line in lines:
+        if ":" in line:
+            parts = line.split(":", 1)
+            if len(parts) == 2 and parts[1].strip():
+                return parts[1].strip()
+
+    # Возвращаем последнюю строку
+    return lines[-1] if lines else "Информация не найдена"
+
+
+def calculate_confidence(response: str) -> float:
+    """Рассчитывает уверенность в ответе"""
+    uncertainty_phrases = [
+        "возможно", "вероятно", "может быть", "предположительно",
+        "не ясно", "не уверен", "не определено", "информация не найдена"
+    ]
+
+    confidence = 0.8
+    response_lower = response.lower()
+
+    for phrase in uncertainty_phrases:
+        if phrase in response_lower:
+            confidence -= 0.1
+
+    return max(0.1, min(confidence, 1.0))
 
 
 async def process_llm_query_async(model_name: str, prompt: str, context: str,
@@ -577,6 +691,112 @@ async def get_llm_models():
         logger.exception(f"Ошибка получения моделей: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# Добавляем в существующий main.py
+
+@app.get("/applications/{application_id}/stats")
+async def get_application_stats(application_id: str):
+    """Асинхронно получает статистику по заявке"""
+    try:
+        loop = asyncio.get_event_loop()
+        stats = await loop.run_in_executor(
+            executor,
+            qdrant_manager.get_stats,
+            application_id
+        )
+        return {"status": "success", "stats": stats}
+    except Exception as e:
+        logger.exception(f"Ошибка получения статистики: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/applications/{application_id}/chunks")
+async def get_application_chunks(application_id: str, limit: int = 500):
+    """Асинхронно получает чанки заявки"""
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _get_chunks():
+            from qdrant_client.http import models
+
+            response = qdrant_manager.client.scroll(
+                collection_name=qdrant_manager.collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="metadata.application_id",
+                            match=models.MatchValue(value=application_id)
+                        )
+                    ]
+                ),
+                limit=limit,
+                with_payload=True,
+                with_vectors=False
+            )
+
+            # Преобразуем результаты
+            chunks = []
+            for point in response[0]:
+                if hasattr(point, 'payload'):
+                    chunk = {
+                        "id": point.id,
+                        "text": point.payload.get("page_content", ""),
+                        "metadata": point.payload.get("metadata", {})
+                    }
+                    chunks.append(chunk)
+
+            # Сортируем по chunk_index
+            chunks.sort(key=lambda x: x["metadata"].get("chunk_index", 0))
+            return chunks
+
+        chunks = await loop.run_in_executor(executor, _get_chunks)
+        return {"status": "success", "chunks": chunks}
+
+    except Exception as e:
+        logger.exception(f"Ошибка получения чанков: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/applications/{application_id}")
+async def delete_application_data(application_id: str):
+    """Асинхронно удаляет данные заявки из векторного хранилища"""
+    try:
+        loop = asyncio.get_event_loop()
+        deleted_count = await loop.run_in_executor(
+            executor,
+            qdrant_manager.delete_application,
+            application_id
+        )
+        return {
+            "status": "success",
+            "deleted_count": deleted_count,
+            "message": f"Удалено {deleted_count} документов"
+        }
+    except Exception as e:
+        logger.exception(f"Ошибка удаления данных заявки: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/collections/{collection_name}/info")
+async def get_collection_info(collection_name: str):
+    """Получает информацию о коллекции"""
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _get_info():
+            return {
+                "exists": collection_name in [c.name for c in qdrant_manager.client.get_collections().collections],
+                "vector_size": qdrant_manager.vector_size,
+                "embeddings_type": "ollama",
+                "model_name": qdrant_manager.model_name
+            }
+
+        info = await loop.run_in_executor(executor, _get_info)
+        return {"status": "success", "info": info}
+
+    except Exception as e:
+        logger.exception(f"Ошибка получения информации о коллекции: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
