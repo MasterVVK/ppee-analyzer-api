@@ -32,12 +32,13 @@ qdrant_manager = None
 reranker = None
 executor = ThreadPoolExecutor(max_workers=10)
 reranker_semaphore = None
+reranker_initialized = False  # Флаг инициализации ререйтера
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global redis_client, qdrant_manager, reranker, reranker_semaphore
+    global redis_client, qdrant_manager, reranker_semaphore
 
     # Инициализация семафора для ререйтера
     reranker_semaphore = asyncio.Semaphore(1)
@@ -45,7 +46,7 @@ async def lifespan(app: FastAPI):
     # Инициализация Redis с асинхронным клиентом
     redis_client = await redis.from_url("redis://localhost:6379", decode_responses=True)
 
-    # Инициализация QdrantManager в отдельном потоке
+    # Инициализация QdrantManager БЕЗ загрузки моделей
     loop = asyncio.get_event_loop()
     qdrant_manager = await loop.run_in_executor(
         executor,
@@ -55,23 +56,13 @@ async def lifespan(app: FastAPI):
             port=6333,
             embeddings_type="ollama",
             model_name="bge-m3",
-            ollama_url="http://localhost:11434"
+            ollama_url="http://localhost:11434",
+            check_availability=False  # ВАЖНО: Отключаем проверку при старте
         )
     )
 
-    # Инициализация ререйтера (опционально)
-    try:
-        reranker = await loop.run_in_executor(
-            executor,
-            lambda: BGEReranker(
-                model_name="BAAI/bge-reranker-v2-m3",
-                device="cuda",
-                min_vram_mb=500
-            )
-        )
-    except Exception as e:
-        logger.warning(f"Не удалось инициализировать ререйтер: {e}")
-        reranker = None
+    # НЕ инициализируем ререйтер при старте
+    logger.info("Сервис запущен. Модели будут загружены при первом использовании.")
 
     # Запускаем периодическую очистку памяти
     cleanup_task = asyncio.create_task(periodic_cleanup())
@@ -152,6 +143,35 @@ async def periodic_cleanup():
         await asyncio.sleep(300)  # Каждые 5 минут
         cleanup_gpu_memory()
         logger.info("Выполнена периодическая очистка памяти")
+
+
+# Функция для ленивой инициализации ререйтера
+async def get_reranker():
+    """Ленивая инициализация ререйтера при первом использовании"""
+    global reranker, reranker_initialized
+
+    if not reranker_initialized:
+        async with reranker_semaphore:  # Блокируем для потокобезопасности
+            if not reranker_initialized:  # Двойная проверка
+                try:
+                    logger.info("Инициализация ререйтера при первом использовании...")
+                    loop = asyncio.get_event_loop()
+                    reranker = await loop.run_in_executor(
+                        executor,
+                        lambda: BGEReranker(
+                            model_name="BAAI/bge-reranker-v2-m3",
+                            device="cuda",
+                            min_vram_mb=500
+                        )
+                    )
+                    reranker_initialized = True
+                    logger.info("Ререйтер успешно инициализирован")
+                except Exception as e:
+                    logger.warning(f"Не удалось инициализировать ререйтер: {e}")
+                    reranker = None
+                    reranker_initialized = True  # Помечаем как инициализированный, чтобы не пытаться снова
+
+    return reranker
 
 
 # Асинхронные вспомогательные функции
@@ -363,13 +383,19 @@ def vector_search(application_id: str, query: str, limit: int,
                 "search_type": "vector"
             })
 
-        # Ререйтинг
-        if use_reranker and reranker and results:
-            try:
-                results = reranker.rerank(query, results, top_k=limit, text_key="text")
-            finally:
-                # ВАЖНО: Освобождаем ресурсы после ререйтинга
-                cleanup_gpu_memory()
+        # Ререйтинг (не загружаем модель, если не нужен)
+        if use_reranker and results:
+            # Получаем ререйтер через asyncio
+            loop = asyncio.new_event_loop()
+            current_reranker = loop.run_until_complete(get_reranker())
+            loop.close()
+
+            if current_reranker:
+                try:
+                    results = current_reranker.rerank(query, results, top_k=limit, text_key="text")
+                finally:
+                    # ВАЖНО: Освобождаем ресурсы после ререйтинга
+                    cleanup_gpu_memory()
 
         return results[:limit]
     except Exception as e:
@@ -424,12 +450,18 @@ def hybrid_search(application_id: str, query: str, limit: int,
         combined = combine_results(vector_results, text_results, vector_weight, text_weight, limit)
 
         # Ререйтинг
-        if use_reranker and reranker and combined:
-            try:
-                combined = reranker.rerank(query, combined, top_k=limit, text_key="text")
-            finally:
-                # ВАЖНО: Освобождаем ресурсы после ререйтинга
-                cleanup_gpu_memory()
+        if use_reranker and combined:
+            # Получаем ререйтер через asyncio
+            loop = asyncio.new_event_loop()
+            current_reranker = loop.run_until_complete(get_reranker())
+            loop.close()
+
+            if current_reranker:
+                try:
+                    combined = current_reranker.rerank(query, combined, top_k=limit, text_key="text")
+                finally:
+                    # ВАЖНО: Освобождаем ресурсы после ререйтинга
+                    cleanup_gpu_memory()
 
         return combined[:limit]
     except Exception as e:
@@ -885,6 +917,78 @@ async def manual_cleanup():
         }
     except Exception as e:
         logger.error(f"Ошибка при очистке памяти: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/preload-models")
+async def preload_models():
+    """Предварительная загрузка моделей в память (опционально)"""
+    try:
+        loop = asyncio.get_event_loop()
+
+        # Загружаем эмбеддинги
+        logger.info("Предзагрузка эмбеддингов...")
+        await loop.run_in_executor(
+            executor,
+            lambda: qdrant_manager.embeddings  # Вызов property инициализирует эмбеддинги
+        )
+
+        # Загружаем ререйтер
+        logger.info("Предзагрузка ререйтера...")
+        await get_reranker()
+
+        # Получаем информацию о памяти
+        memory_info = {}
+        if torch.cuda.is_available():
+            memory_info = {
+                "allocated": f"{torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB",
+                "reserved": f"{torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB",
+                "free": f"{(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1024 ** 3:.2f} GB"
+            }
+
+        return {
+            "status": "success",
+            "message": "Модели загружены в память",
+            "memory_info": memory_info
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при предзагрузке моделей: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/unload-models")
+async def unload_models():
+    """Выгрузка моделей из памяти для освобождения VRAM"""
+    global reranker, reranker_initialized
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        # Выгружаем ререйтер
+        if reranker:
+            await loop.run_in_executor(executor, reranker.cleanup)
+            reranker = None
+            reranker_initialized = False
+
+        # Очищаем память
+        cleanup_gpu_memory()
+
+        # Получаем информацию о памяти
+        memory_info = {}
+        if torch.cuda.is_available():
+            memory_info = {
+                "allocated": f"{torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB",
+                "reserved": f"{torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB",
+                "free": f"{(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1024 ** 3:.2f} GB"
+            }
+
+        return {
+            "status": "success",
+            "message": "Модели выгружены из памяти",
+            "memory_info": memory_info
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при выгрузке моделей: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

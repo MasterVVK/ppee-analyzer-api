@@ -61,46 +61,73 @@ class QdrantManager:
         self.device = device
         self.embeddings_type = embeddings_type
         self.ollama_url = ollama_url
+        self.ollama_options = ollama_options
+        self.check_availability = check_availability
+        self._embeddings = None  # Ленивая инициализация
+        self._embeddings_initialized = False
+        self._vector_store = None  # Ленивая инициализация векторного хранилища
 
         # Инициализация клиента Qdrant
         self.client = QdrantClient(host=host, port=port)
-
-        # Инициализация модели эмбеддингов
-        if embeddings_type.lower() == "ollama":
-            logger.info(f"Используем эмбеддинги Ollama с моделью {model_name}")
-
-            # Получаем опции из OllamaEmbeddings
-            options = OllamaEmbeddings.get_default_options()
-
-            # Обновляем опции, если они переданы
-            if ollama_options:
-                options.update(ollama_options)
-
-            self.embeddings = OllamaEmbeddings(
-                model_name=model_name,
-                base_url=ollama_url,
-                normalize_embeddings=True,
-                check_availability=check_availability,
-                options=options
-            )
-        else:  # По умолчанию используем HuggingFace
-            logger.info(f"Используем эмбеддинги HuggingFace с моделью {model_name}")
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name=model_name,
-                model_kwargs={'device': device},
-                encode_kwargs={'normalize_embeddings': True}
-            )
 
         # Проверяем существование коллекции и создаем при необходимости
         if create_collection:
             self._ensure_collection_exists()
 
-        # Инициализация векторного хранилища
-        self.vector_store = QdrantVectorStore(
-            client=self.client,
-            collection_name=self.collection_name,
-            embedding=self.embeddings  # Изменяем embeddings на embedding
-        )
+        # НЕ инициализируем эмбеддинги сразу
+        logger.info("QdrantManager инициализирован. Эмбеддинги будут загружены при первом использовании.")
+
+    @property
+    def embeddings(self):
+        """Ленивая загрузка эмбеддингов"""
+        if not self._embeddings_initialized:
+            logger.info("Инициализация эмбеддингов при первом использовании...")
+
+            if self.embeddings_type.lower() == "ollama":
+                logger.info(f"Используем эмбеддинги Ollama с моделью {self.model_name}")
+
+                # Получаем опции из OllamaEmbeddings
+                options = OllamaEmbeddings.get_default_options()
+
+                # Обновляем опции, если они переданы
+                if self.ollama_options:
+                    options.update(self.ollama_options)
+
+                self._embeddings = OllamaEmbeddings(
+                    model_name=self.model_name,
+                    base_url=self.ollama_url,
+                    normalize_embeddings=True,
+                    check_availability=self.check_availability,  # Используем переданный параметр
+                    options=options
+                )
+            else:  # По умолчанию используем HuggingFace
+                logger.info(f"Используем эмбеддинги HuggingFace с моделью {self.model_name}")
+                self._embeddings = HuggingFaceEmbeddings(
+                    model_name=self.model_name,
+                    model_kwargs={'device': self.device},
+                    encode_kwargs={'normalize_embeddings': True}
+                )
+
+            self._embeddings_initialized = True
+
+        return self._embeddings
+
+    @property
+    def vector_store(self):
+        """Ленивая инициализация векторного хранилища"""
+        if self._vector_store is None:
+            # Убеждаемся, что эмбеддинги инициализированы
+            _ = self.embeddings
+
+            # Инициализируем векторное хранилище
+            self._vector_store = QdrantVectorStore(
+                client=self.client,
+                collection_name=self.collection_name,
+                embedding=self._embeddings  # Используем уже инициализированные эмбеддинги
+            )
+            logger.info("Векторное хранилище инициализировано")
+
+        return self._vector_store
 
     def _ensure_collection_exists(self):
         """Проверяет существование коллекции и создает при необходимости"""
@@ -150,7 +177,7 @@ class QdrantManager:
         for i in range(0, total_documents, batch_size):
             end_idx = min(i + batch_size, total_documents)
             batch = documents[i:end_idx]
-            self.vector_store.add_documents(batch)
+            self.vector_store.add_documents(batch)  # Используем property для ленивой инициализации
             logger.info(f"Проиндексирована партия {i+1}-{end_idx} из {total_documents}")
 
         logger.info(f"Индексация завершена. Добавлено {total_documents} документов")
@@ -191,7 +218,7 @@ class QdrantManager:
                 filter_obj = models.Filter(must=conditions)
 
         # Выполнение поиска
-        search_results = self.vector_store.similarity_search_with_score(
+        search_results = self.vector_store.similarity_search_with_score(  # Используем property
             query=processed_query,
             filter=filter_obj,
             k=k

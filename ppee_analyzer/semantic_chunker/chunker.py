@@ -23,7 +23,6 @@ from .utils import (
 
 # Импорты для интеграции с ppee_analyzer
 from langchain_core.documents import Document
-#from ..document_processor.splitter import PPEEDocumentSplitter
 
 # Настройка логирования
 logger = logging.getLogger(__name__)
@@ -45,42 +44,58 @@ class SemanticChunker:
         if not self.docling_available:
             raise ImportError("Библиотека docling не установлена. Установите её для работы с SemanticChunker.")
 
-        # Импортируем docling только если он доступен
-        import docling
-        from docling.document_converter import DocumentConverter, PdfFormatOption
-        from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorDevice, AcceleratorOptions
+        self.use_gpu = use_gpu
+        self.threads = threads
+        self._converter = None  # Ленивая инициализация
+        self._converter_initialized = False
 
-        # Проверяем доступность GPU
-        if use_gpu is None:
-            use_gpu = detect_gpu_availability()
+        logger.info(f"SemanticChunker инициализирован (ленивая загрузка)")
 
-        # Настраиваем опции ускорителя
-        accelerator_options = AcceleratorOptions(
-            num_threads=threads,
-            device=AcceleratorDevice.CUDA if use_gpu else AcceleratorDevice.CPU
-        )
+    @property
+    def converter(self):
+        """Ленивая загрузка конвертера"""
+        if not self._converter_initialized:
+            logger.info("Инициализация Docling конвертера при первом использовании...")
 
-        # Настраиваем опции обработки PDF
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.accelerator_options = accelerator_options
-        pipeline_options.do_table_structure = True
-        pipeline_options.table_structure_options.do_cell_matching = True
+            # Импортируем docling только при первом использовании
+            import docling
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorDevice, AcceleratorOptions
 
-        # Если используем GPU, включаем Flash Attention 2 для лучшей производительности
-        if use_gpu:
-            pipeline_options.accelerator_options.cuda_use_flash_attention2 = True
+            # Проверяем доступность GPU
+            if self.use_gpu is None:
+                self.use_gpu = detect_gpu_availability()
 
-        # Настраиваем конвертер Docling
-        self.converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(
-                    pipeline_options=pipeline_options
-                )
-            }
-        )
+            # Настраиваем опции ускорителя
+            accelerator_options = AcceleratorOptions(
+                num_threads=self.threads,
+                device=AcceleratorDevice.CUDA if self.use_gpu else AcceleratorDevice.CPU
+            )
 
-        logger.info(f"SemanticChunker инициализирован (GPU: {use_gpu}, потоков: {threads})")
+            # Настраиваем опции обработки PDF
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.accelerator_options = accelerator_options
+            pipeline_options.do_table_structure = True
+            pipeline_options.table_structure_options.do_cell_matching = True
+
+            # Если используем GPU, включаем Flash Attention 2
+            if self.use_gpu:
+                pipeline_options.accelerator_options.cuda_use_flash_attention2 = True
+
+            # Настраиваем конвертер Docling
+            self._converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_options=pipeline_options
+                    )
+                }
+            )
+
+            self._converter_initialized = True
+            logger.info(f"Docling конвертер инициализирован (GPU: {self.use_gpu}, потоков: {self.threads})")
+
+        return self._converter
 
     def extract_chunks(self, pdf_path: str) -> List[Dict]:
         """
@@ -97,7 +112,7 @@ class SemanticChunker:
 
         logger.info(f"Начало обработки документа: {pdf_path}")
 
-        # Конвертируем PDF с помощью Docling
+        # Конвертируем PDF с помощью Docling (используем property для ленивой загрузки)
         result = self.converter.convert(pdf_path)
         document = result.document
 
@@ -699,5 +714,3 @@ class SemanticChunker:
             document_path=pdf_path,
             statistics=statistics
         )
-
-
