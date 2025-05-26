@@ -1281,6 +1281,69 @@ async def get_task_results_singular(task_id: str):
     # Просто вызываем функцию с множественным числом
     return await get_task_results(task_id)
 
+
+# Добавьте этот эндпоинт в ваш FastAPI main.py файл
+
+@app.delete("/applications/{application_id}/documents/{document_id}")
+async def delete_document_chunks(application_id: str, document_id: str):
+    """Удаляет чанки конкретного документа из векторного хранилища"""
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _delete_chunks():
+            from qdrant_client.http import models
+
+            # Создаем фильтр для удаления чанков конкретного документа
+            delete_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="metadata.application_id",
+                        match=models.MatchValue(value=application_id)
+                    ),
+                    models.FieldCondition(
+                        key="metadata.document_id",
+                        match=models.MatchValue(value=document_id)
+                    )
+                ]
+            )
+
+            # Сначала получаем количество документов для удаления
+            scroll_result = qdrant_manager.client.scroll(
+                collection_name=qdrant_manager.collection_name,
+                scroll_filter=delete_filter,
+                limit=1000,
+                with_payload=False,
+                with_vectors=False
+            )
+
+            points_to_delete = [point.id for point in scroll_result[0]]
+            deleted_count = len(points_to_delete)
+
+            # Удаляем найденные точки
+            if points_to_delete:
+                qdrant_manager.client.delete(
+                    collection_name=qdrant_manager.collection_name,
+                    points_selector=models.PointIdsList(
+                        points=points_to_delete
+                    )
+                )
+
+                logger.info(f"Удалено {deleted_count} чанков документа {document_id} из заявки {application_id}")
+
+            return deleted_count
+
+        deleted_count = await loop.run_in_executor(executor, _delete_chunks)
+
+        return {
+            "status": "success",
+            "deleted_count": deleted_count,
+            "message": f"Удалено {deleted_count} чанков документа {document_id}"
+        }
+
+    except Exception as e:
+        logger.exception(f"Ошибка удаления чанков документа: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
 
