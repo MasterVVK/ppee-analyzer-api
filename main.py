@@ -13,6 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 import gc
 import torch
 import time
+import psutil
+import GPUtil
+
 
 # Импорты из ppee_analyzer
 from ppee_analyzer.vector_store import QdrantManager, BGEReranker, OllamaEmbeddings
@@ -111,6 +114,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Разрешаем все источники для тестирования
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Pydantic модели
 class IndexDocumentRequest(BaseModel):
@@ -1343,6 +1355,88 @@ async def delete_document_chunks(application_id: str, document_id: str):
     except Exception as e:
         logger.exception(f"Ошибка удаления чанков документа: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.get("/api/v1/system/stats")
+async def get_system_stats():
+    """Получение статистики использования системных ресурсов"""
+    try:
+        # CPU статистика
+        cpu_percent = psutil.cpu_percent(interval=1)
+
+        # Память
+        memory = psutil.virtual_memory()
+        memory_percent = memory.percent
+        memory_used = memory.used / (1024 ** 3)  # В гигабайтах
+        memory_total = memory.total / (1024 ** 3)  # В гигабайтах
+
+        # VRAM (GPU память)
+        vram_percent = 0
+        vram_used = 0
+        vram_total = 0
+        gpu_name = "Не обнаружено"
+        gpu_temperature = None
+        gpu_utilization = 0
+
+        try:
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu = gpus[0]  # Берем первую GPU
+                vram_percent = gpu.memoryUtil * 100
+                vram_used = gpu.memoryUsed / 1024  # В гигабайтах
+                vram_total = gpu.memoryTotal / 1024  # В гигабайтах
+                gpu_name = gpu.name
+                gpu_temperature = gpu.temperature
+                gpu_utilization = gpu.load * 100  # Процент использования GPU
+        except Exception as e:
+            logger.warning(f"Не удалось получить информацию о GPU: {e}")
+
+        # Дополнительная информация о процессах
+        process_count = len(psutil.pids())
+
+        # Информация о дисках (опционально)
+        disk_usage = psutil.disk_usage('/')
+        disk_percent = disk_usage.percent
+
+        return {
+            "cpu": {
+                "percent": round(cpu_percent, 1),
+                "cores": psutil.cpu_count(logical=False),
+                "threads": psutil.cpu_count(logical=True)
+            },
+            "memory": {
+                "percent": round(memory_percent, 1),
+                "used_gb": round(memory_used, 2),
+                "total_gb": round(memory_total, 2),
+                "available_gb": round(memory.available / (1024 ** 3), 2)
+            },
+            "gpu": {
+                "name": gpu_name,
+                "vram_percent": round(vram_percent, 1),
+                "vram_used_gb": round(vram_used, 2),
+                "vram_total_gb": round(vram_total, 2),
+                "temperature": gpu_temperature,
+                "utilization": round(gpu_utilization, 1)
+            },
+            "system": {
+                "process_count": process_count,
+                "disk_percent": round(disk_percent, 1),
+                "active_indexing_tasks": active_indexing_tasks,
+                "indexing_queue_size": indexing_queue.qsize() if indexing_queue else 0
+            }
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при получении системной статистики: {e}")
+        return {
+            "error": str(e),
+            "cpu": {"percent": 0, "cores": 0, "threads": 0},
+            "memory": {"percent": 0, "used_gb": 0, "total_gb": 0, "available_gb": 0},
+            "gpu": {"name": "Ошибка", "vram_percent": 0, "vram_used_gb": 0, "vram_total_gb": 0, "temperature": None,
+                    "utilization": 0},
+            "system": {"process_count": 0, "disk_percent": 0, "active_indexing_tasks": 0, "indexing_queue_size": 0}
+        }
+
 
 if __name__ == "__main__":
     import uvicorn
