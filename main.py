@@ -12,6 +12,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import gc
 import torch
+import time
 
 # Импорты из ppee_analyzer
 from ppee_analyzer.vector_store import QdrantManager, BGEReranker, OllamaEmbeddings
@@ -39,8 +40,6 @@ indexing_queue = None  # Очередь для задач индексации
 indexing_semaphore = None  # Семафор для ограничения одной индексации
 
 # Настройки очистки памяти
-CLEANUP_POLICY = os.environ.get("CLEANUP_POLICY", "aggressive")  # aggressive, moderate, disabled
-CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "30"))  # Задержка перед очисткой в секундах
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10s")  # Время хранения модели Ollama в памяти
 
 
@@ -150,7 +149,7 @@ class ProcessQueryRequest(BaseModel):
 
 # Функции для управления памятью
 def cleanup_gpu_memory():
-    """Освобождает память GPU"""
+    """Освобождает память GPU - только кэши, не выгружает модели"""
     try:
         # Явный вызов сборщика мусора Python
         gc.collect()
@@ -159,17 +158,20 @@ def cleanup_gpu_memory():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            logger.info("GPU память очищена")
+            logger.info("GPU кэши очищены")
     except Exception as e:
         logger.warning(f"Ошибка при очистке GPU памяти: {e}")
 
 
 async def periodic_cleanup():
-    """Периодически очищает неиспользуемую память"""
+    """Периодически очищает неиспользуемые кэши GPU"""
     while True:
         await asyncio.sleep(300)  # Каждые 5 минут
-        cleanup_gpu_memory()
-        logger.info("Выполнена периодическая очистка памяти")
+
+        # Очищаем только если нет активных задач
+        if active_indexing_tasks == 0:
+            cleanup_gpu_memory()
+            logger.info("Выполнена периодическая очистка GPU кэшей")
 
 
 async def indexing_queue_worker():
@@ -196,77 +198,6 @@ async def indexing_queue_worker():
         except Exception as e:
             logger.error(f"Ошибка в обработчике очереди индексации: {e}")
             await asyncio.sleep(1)  # Небольшая пауза при ошибке
-    """Периодически очищает неиспользуемую память"""
-    while True:
-        await asyncio.sleep(300)  # Каждые 5 минут
-        cleanup_gpu_memory()
-        logger.info("Выполнена периодическая очистка памяти")
-
-
-async def cleanup_after_indexing():
-    """Полная очистка памяти после индексации, включая выгрузку моделей"""
-    global qdrant_manager, active_indexing_tasks
-
-    try:
-        # Проверяем политику очистки
-        if CLEANUP_POLICY == "disabled":
-            logger.info("Очистка памяти отключена политикой CLEANUP_POLICY=disabled")
-            return
-
-        # Проверяем, есть ли еще активные задачи индексации или задачи в очереди
-        async with indexing_lock:
-            queue_size = indexing_queue.qsize() if indexing_queue else 0
-            if active_indexing_tasks > 0 or queue_size > 0:
-                logger.info(
-                    f"Пропускаем очистку, есть активные задачи: {active_indexing_tasks}, в очереди: {queue_size}")
-                return
-
-        # Ждем перед очисткой (на случай если сразу начнется новая индексация)
-        if CLEANUP_DELAY > 0:
-            logger.info(f"Ожидание {CLEANUP_DELAY} секунд перед очисткой памяти...")
-            await asyncio.sleep(CLEANUP_DELAY)
-
-            # Проверяем еще раз после задержки
-            async with indexing_lock:
-                queue_size = indexing_queue.qsize() if indexing_queue else 0
-                if active_indexing_tasks > 0 or queue_size > 0:
-                    logger.info(
-                        f"Очистка отменена, появились новые задачи: активных={active_indexing_tasks}, в очереди={queue_size}")
-                    return
-
-        logger.info("Начало полной очистки памяти после индексации...")
-
-        if CLEANUP_POLICY == "aggressive":
-            # Агрессивная очистка - выгружаем все
-            if qdrant_manager and hasattr(qdrant_manager,
-                                          '_embeddings_initialized') and qdrant_manager._embeddings_initialized:
-                # Сбрасываем эмбеддинги
-                qdrant_manager._embeddings = None
-                qdrant_manager._embeddings_initialized = False
-                qdrant_manager._vector_store = None
-                logger.info("Эмбеддинги выгружены из памяти (aggressive)")
-        elif CLEANUP_POLICY == "moderate":
-            # Умеренная очистка - только очищаем кэши, но оставляем модели загруженными
-            logger.info("Умеренная очистка памяти (moderate) - модели остаются загруженными")
-
-        # Очищаем память Python
-        import gc
-        gc.collect()
-
-        # Очищаем CUDA кэш
-        cleanup_gpu_memory()
-
-        # Дополнительная пауза для освобождения ресурсов
-        await asyncio.sleep(1)
-
-        # Проверяем освобожденную память
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024 ** 3
-            reserved = torch.cuda.memory_reserved() / 1024 ** 3
-            logger.info(f"После очистки: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
-
-    except Exception as e:
-        logger.error(f"Ошибка при полной очистке памяти: {e}")
 
 
 # Функция для ленивой инициализации ререйтера
@@ -413,6 +344,10 @@ async def process_document_with_semantic_chunker(document_path: str, application
                 # Принудительная сборка мусора
                 import gc
                 gc.collect()
+
+                # Очищаем только GPU кэши (не модели!)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 logger.info("SemanticChunker освобожден из памяти")
 
@@ -588,8 +523,8 @@ async def index_document_task_worker(request: IndexDocumentRequest):
             active_indexing_tasks -= 1
             logger.info(f"Индексация завершена. Активных задач: {active_indexing_tasks}")
 
-        # Очищаем память только если это была последняя задача
-        await cleanup_after_indexing()
+        # ИЗМЕНЕНИЕ: Убираем агрессивную очистку, оставляем только легкую очистку GPU кэшей
+        cleanup_gpu_memory()
 
 
 async def index_document_task(request: IndexDocumentRequest):
@@ -684,12 +619,12 @@ def vector_search(application_id: str, query: str, limit: int,
                 try:
                     results = current_reranker.rerank(query, results, top_k=limit, text_key="text")
                 finally:
-                    # ВАЖНО: Освобождаем ресурсы после ререйтинга
+                    # ВАЖНО: Освобождаем только кэши после ререйтинга
                     cleanup_gpu_memory()
 
         return results[:limit]
     except Exception as e:
-        # При ошибке тоже освобождаем ресурсы
+        # При ошибке тоже освобождаем кэши
         cleanup_gpu_memory()
         raise
 
@@ -750,12 +685,12 @@ def hybrid_search(application_id: str, query: str, limit: int,
                 try:
                     combined = current_reranker.rerank(query, combined, top_k=limit, text_key="text")
                 finally:
-                    # ВАЖНО: Освобождаем ресурсы после ререйтинга
+                    # ВАЖНО: Освобождаем только кэши после ререйтинга
                     cleanup_gpu_memory()
 
         return combined[:limit]
     except Exception as e:
-        # При ошибке тоже освобождаем ресурсы
+        # При ошибке тоже освобождаем кэши
         cleanup_gpu_memory()
         raise
 
@@ -957,7 +892,7 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                         }
                     })
 
-                # После каждых 10 параметров освобождаем память
+                # После каждых 10 параметров освобождаем кэши
                 if (i + 1) % 10 == 0:
                     cleanup_gpu_memory()
 
@@ -965,7 +900,7 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                 logger.error(f"Ошибка при обработке параметра {item['id']}: {e}")
                 error_count += 1
 
-        # Освобождаем память после завершения анализа
+        # Освобождаем кэши после завершения анализа
         cleanup_gpu_memory()
 
         # Завершение
@@ -982,7 +917,7 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
 
     except Exception as e:
         logger.exception(f"Ошибка анализа: {e}")
-        cleanup_gpu_memory()  # Освобождаем память при ошибке
+        cleanup_gpu_memory()  # Освобождаем кэши при ошибке
         await update_task_status(request.task_id, "FAILURE", 0, "error", str(e))
 
 
@@ -1187,7 +1122,7 @@ async def get_collection_info(collection_name: str):
 
 @app.post("/cleanup")
 async def manual_cleanup():
-    """Ручная очистка памяти GPU"""
+    """Ручная очистка памяти GPU - только кэши"""
     try:
         cleanup_gpu_memory()
 
@@ -1202,7 +1137,7 @@ async def manual_cleanup():
 
         return {
             "status": "success",
-            "message": "Память очищена",
+            "message": "GPU кэши очищены",
             "memory_info": memory_info
         }
     except Exception as e:
@@ -1287,6 +1222,43 @@ async def unload_models():
         logger.error(f"Ошибка при выгрузке моделей: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# Добавьте эти эндпоинты в ваш FastAPI main.py файл после существующего эндпоинта get_task_status
+
+@app.get("/tasks/{task_id}/status")
+async def get_task_status_plural(task_id: str):
+    """Асинхронно получает статус задачи из Redis (альтернативный URL с 's')"""
+    # Просто вызываем существующую функцию
+    return await get_task_status(task_id)
+
+
+@app.get("/tasks/{task_id}/results")
+async def get_task_results(task_id: str):
+    """Получает результаты выполненной задачи"""
+    task_data = await redis_client.get(f"task:{task_id}")
+    if not task_data:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    data = json.loads(task_data)
+
+    # Проверяем, что задача завершена успешно
+    if data.get("status") != "SUCCESS":
+        raise HTTPException(status_code=400, detail=f"Task not completed. Status: {data.get('status')}")
+
+    # Возвращаем результаты
+    result = data.get("result", {})
+    return {
+        "status": "success",
+        "task_id": task_id,
+        "results": result.get("results", []) if isinstance(result, dict) else []
+    }
+
+
+@app.get("/task/{task_id}/results")
+async def get_task_results_singular(task_id: str):
+    """Получает результаты выполненной задачи (альтернативный URL без 's')"""
+    # Просто вызываем функцию с множественным числом
+    return await get_task_results(task_id)
 
 if __name__ == "__main__":
     import uvicorn
