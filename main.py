@@ -17,7 +17,7 @@ import time
 # Импорты из ppee_analyzer
 from ppee_analyzer.vector_store import QdrantManager, BGEReranker, OllamaEmbeddings
 from ppee_analyzer.semantic_chunker import SemanticChunker
-from ppee_analyzer.checklist import ChecklistAnalyzer
+#from ppee_analyzer.checklist import ChecklistAnalyzer
 from langchain_core.documents import Document
 
 # Импорты из локальных адаптеров
@@ -754,7 +754,7 @@ def get_document_key(doc: Dict) -> str:
 
 @app.post("/analyze")
 async def analyze_application(request: AnalyzeApplicationRequest):
-    """Запускает асинхронный анализ заявки"""
+#    Запускает асинхронный анализ заявки
     asyncio.create_task(analyze_application_task(request))
     return {"status": "started", "task_id": request.task_id}
 
@@ -765,7 +765,7 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
         await update_task_status(request.task_id, "PROGRESS", 10, "prepare", "Инициализация анализа...")
 
         loop = asyncio.get_event_loop()
-        analyzer = ChecklistAnalyzer(qdrant_manager)
+        #analyzer = ChecklistAnalyzer(qdrant_manager)
         processed_count = 0
         error_count = 0
         total_items = len(request.checklist_items)
@@ -841,15 +841,22 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                     # Форматируем контекст
                     context = "\n\n".join([doc.page_content for doc in search_documents])
 
-                    # Вызываем LLM асинхронно
+                    # ВАЖНО: Формируем полный промпт здесь
+                    full_prompt = item['llm_prompt_template'].replace(
+                        "{query}", query
+                    ).replace(
+                        "{context}", context
+                    )
+
+                    # Вызываем LLM асинхронно с полным промптом
                     llm_response = await process_llm_query_async(
                         item['llm_model'],
-                        item['llm_prompt_template'],
-                        context,
+                        full_prompt,  # Передаем полный промпт
+                        "",  # Контекст уже включен в промпт
                         {
                             'temperature': item.get('llm_temperature', 0.1),
                             'max_tokens': item.get('llm_max_tokens', 1000),
-                            'search_query': query
+                            'context_length': item.get('context_length', 8192)
                         },
                         query
                     )
@@ -868,14 +875,16 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                                            for res in search_results],
                         "search_method": search_method,
                         "llm_request": {
-                            'prompt_template': item['llm_prompt_template'],
-                            'query': query,
-                            'context': context,
+                            'prompt': full_prompt,  # Сохраняем ПОЛНЫЙ промпт
+                            'prompt_template': item['llm_prompt_template'],  # И шаблон для справки
                             'model': item['llm_model'],
                             'temperature': item.get('llm_temperature', 0.1),
                             'max_tokens': item.get('llm_max_tokens', 1000),
-                            'response': llm_response,
-                            'search_method': search_method
+                            'context_length': item.get('context_length', 8192),
+                            'response': llm_response,  # Полный ответ LLM
+                            'search_query': query,
+                            'search_method': search_method,
+                            'context': context  # Можно сохранить и контекст для отладки
                         }
                     })
                     processed_count += 1
@@ -888,7 +897,9 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                         "search_method": search_method,
                         "llm_request": {
                             'error': 'Не найдено результатов поиска',
-                            'search_method': search_method
+                            'search_method': search_method,
+                            'model': item['llm_model'],
+                            'search_query': query
                         }
                     })
 
@@ -899,6 +910,16 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
             except Exception as e:
                 logger.error(f"Ошибка при обработке параметра {item['id']}: {e}")
                 error_count += 1
+                results.append({
+                    "parameter_id": item['id'],
+                    "value": "Ошибка обработки",
+                    "confidence": 0.0,
+                    "search_results": [],
+                    "llm_request": {
+                        'error': str(e),
+                        'model': item.get('llm_model', 'unknown')
+                    }
+                })
 
         # Освобождаем кэши после завершения анализа
         cleanup_gpu_memory()
