@@ -421,8 +421,20 @@ async def process_document_with_semantic_chunker(document_path: str, application
                     "section": chunk.get("heading", "Не определено"),
                 }
 
-                if chunk.get("page"):
-                    metadata["page_number"] = chunk.get("page")
+                # Записываем список всех страниц
+                if "all_pages" in chunk and chunk["all_pages"]:
+                    # Сохраняем как строку через запятую для удобства поиска
+                    metadata["page_number"] = ",".join(map(str, chunk["all_pages"]))
+                    # Также сохраняем как список для удобства обработки
+                    metadata["page_numbers"] = chunk["all_pages"]
+                elif chunk.get("pages") and isinstance(chunk["pages"], list):
+                    # Fallback для поля pages
+                    metadata["page_number"] = ",".join(map(str, chunk["pages"]))
+                    metadata["page_numbers"] = chunk["pages"]
+                elif chunk.get("page"):
+                    # Fallback для старого формата с одной страницей
+                    metadata["page_number"] = str(chunk.get("page"))
+                    metadata["page_numbers"] = [chunk.get("page")]
 
                 documents.append(Document(
                     page_content=chunk.get("content", ""),
@@ -461,8 +473,20 @@ async def process_document_with_semantic_chunker(document_path: str, application
                         "section": chunk.get("heading", "Не определено"),
                     }
 
-                    if chunk.get("page"):
-                        metadata["page_number"] = chunk.get("page")
+                    # Записываем список всех страниц
+                    if "all_pages" in chunk and chunk["all_pages"]:
+                        # Сохраняем как строку через запятую для удобства поиска
+                        metadata["page_number"] = ",".join(map(str, chunk["all_pages"]))
+                        # Также сохраняем как список для удобства обработки
+                        metadata["page_numbers"] = chunk["all_pages"]
+                    elif chunk.get("pages") and isinstance(chunk["pages"], list):
+                        # Fallback для поля pages
+                        metadata["page_number"] = ",".join(map(str, chunk["pages"]))
+                        metadata["page_numbers"] = chunk["pages"]
+                    elif chunk.get("page"):
+                        # Fallback для старого формата с одной страницей
+                        metadata["page_number"] = str(chunk.get("page"))
+                        metadata["page_numbers"] = [chunk.get("page")]
 
                     documents.append(Document(
                         page_content=chunk.get("content", ""),
@@ -597,7 +621,6 @@ async def index_document(request: IndexDocumentRequest):
         "task_id": request.task_id,
         "queue_position": indexing_queue.qsize()
     }
-
 
 async def index_document_task_worker(request: IndexDocumentRequest):
     """Воркер для выполнения индексации - вызывается из очереди"""

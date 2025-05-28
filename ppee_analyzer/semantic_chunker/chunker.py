@@ -97,6 +97,8 @@ class SemanticChunker:
 
         return self._converter
 
+    # Замените метод extract_chunks в классе SemanticChunker
+
     def extract_chunks(self, pdf_path: str) -> List[Dict]:
         """
         Извлекает и структурирует документ по смысловым блокам.
@@ -112,7 +114,7 @@ class SemanticChunker:
 
         logger.info(f"Начало обработки документа: {pdf_path}")
 
-        # Конвертируем PDF с помощью Docling (используем property для ленивой загрузки)
+        # Конвертируем PDF с помощью Docling
         result = self.converter.convert(pdf_path)
         document = result.document
 
@@ -122,11 +124,12 @@ class SemanticChunker:
             "type": None,
             "page": None,
             "heading": None,
-            "table_id": None
+            "table_id": None,
+            "all_pages": set()  # Используем set для автоматического удаления дубликатов
         }
 
         current_table = None
-        last_caption = None  # Для хранения последнего заголовка таблицы
+        last_caption = None
 
         # Словарь для отслеживания статистики по страницам
         pages_encountered = set()
@@ -141,9 +144,10 @@ class SemanticChunker:
 
             # Проверяем, есть ли у элемента атрибут label
             if not hasattr(element, 'label'):
-                # Если нет label, но есть текст, добавляем как неопределенный тип
                 if hasattr(element, 'text') and element.text.strip():
                     if current_chunk["content"]:
+                        # Преобразуем set в sorted list перед добавлением
+                        current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
                         chunks.append(current_chunk.copy())
 
                     current_chunk = {
@@ -151,16 +155,18 @@ class SemanticChunker:
                         "type": "unknown",
                         "page": current_page,
                         "heading": None,
-                        "table_id": None
+                        "table_id": None,
+                        "all_pages": {current_page} if current_page else set()
                     }
                 continue
 
             # Определяем тип элемента
             if element.label == "caption" or (
-                    element.label == "text" and hasattr(element, 'text') and re.match(r'^Таблица\s*\d+[.:]',
-                                                                                      element.text, re.IGNORECASE)):
+                    element.label == "text" and hasattr(element, 'text') and
+                    re.match(r'^Таблица\s*\d+[.:]', element.text, re.IGNORECASE)):
                 # Это заголовок таблицы
                 if current_chunk["content"] and current_chunk["type"] != "table":
+                    current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
                     chunks.append(current_chunk.copy())
 
                 last_caption = element.text if hasattr(element, 'text') else str(element)
@@ -169,7 +175,8 @@ class SemanticChunker:
                     "type": None,
                     "page": current_page,
                     "heading": None,
-                    "table_id": None
+                    "table_id": None,
+                    "all_pages": set()
                 }
 
             elif element.label == "table":
@@ -179,15 +186,12 @@ class SemanticChunker:
                 # Получаем контент таблицы
                 table_content = ""
                 try:
-                    # Пробуем экспортировать в markdown с передачей документа
                     table_content = element.export_to_markdown(doc=document)
                 except:
                     try:
-                        # Если не получилось, пробуем DataFrame
                         df = element.export_to_dataframe()
                         table_content = df.to_string()
                     except:
-                        # В крайнем случае используем строковое представление data
                         table_content = str(element.data) if hasattr(element, 'data') else str(element)
 
                 # Если есть caption, добавляем его
@@ -201,28 +205,30 @@ class SemanticChunker:
 
                 # Всегда создаем новый чанк для таблицы
                 if current_chunk["content"]:
+                    current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
                     chunks.append(current_chunk.copy())
 
                 # Создаем чанк для таблицы
-                current_chunk = {
+                table_chunk = {
                     "content": table_content,
                     "type": "table",
                     "page": current_page,
-                    "heading": last_caption,  # Привязываем заголовок к таблице
+                    "heading": last_caption,
                     "table_id": table_id,
-                    "pages": [current_page] if current_page else []
+                    "pages": [current_page] if current_page else [],
+                    "all_pages": sorted([current_page]) if current_page else []
                 }
 
-                # Добавляем этот чанк таблицы
-                chunks.append(current_chunk.copy())
+                chunks.append(table_chunk)
 
-                # Сбрасываем current_chunk и table-related переменные
+                # Сбрасываем current_chunk
                 current_chunk = {
                     "content": "",
                     "type": None,
                     "page": None,
                     "heading": None,
-                    "table_id": None
+                    "table_id": None,
+                    "all_pages": set()
                 }
                 current_table = None
                 last_caption = None
@@ -230,25 +236,32 @@ class SemanticChunker:
             elif element.label == "heading" or element.label == "section_header":
                 # Если это заголовок раздела, начинаем новый чанк
                 if current_chunk["content"]:
+                    current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
                     chunks.append(current_chunk.copy())
 
-                current_table = None  # Сбрасываем идентификатор таблицы
-                last_caption = None  # Сбрасываем заголовок таблицы
+                current_table = None
+                last_caption = None
+
+                # Начинаем новый чанк с заголовком
+                heading_text = element.text if hasattr(element, 'text') else str(element)
                 current_chunk = {
-                    "content": element.text if hasattr(element, 'text') else str(element),
+                    "content": heading_text,
                     "type": "heading",
                     "page": current_page,
-                    "heading": element.text if hasattr(element, 'text') else str(element),
+                    "heading": heading_text,
                     "level": level,
-                    "table_id": None
+                    "table_id": None,
+                    "all_pages": {current_page} if current_page else set()
                 }
 
+                logger.debug(f"Начинаем новый заголовок: '{heading_text[:50]}...' на странице {current_page}")
+
             elif element.label == "document_index":
-                # Обработка оглавления как отдельного типа
+                # Обработка оглавления
                 if current_chunk["content"]:
+                    current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
                     chunks.append(current_chunk.copy())
 
-                # Пробуем получить контент оглавления
                 content = ""
                 if hasattr(element, 'text'):
                     content = element.text
@@ -260,14 +273,15 @@ class SemanticChunker:
                 else:
                     content = str(element)
 
-                current_chunk = {
+                index_chunk = {
                     "content": content,
                     "type": "document_index",
                     "page": current_page,
                     "heading": "Оглавление",
-                    "table_id": None
+                    "table_id": None,
+                    "all_pages": sorted([current_page]) if current_page else []
                 }
-                chunks.append(current_chunk.copy())
+                chunks.append(index_chunk)
 
                 # Сбрасываем current_chunk
                 current_chunk = {
@@ -275,33 +289,53 @@ class SemanticChunker:
                     "type": None,
                     "page": None,
                     "heading": None,
-                    "table_id": None
+                    "table_id": None,
+                    "all_pages": set()
                 }
 
             elif element.label == "text" or element.label == "paragraph" or element.label == "list-item":
                 # Проверяем, не является ли текст подписью к таблице
                 if hasattr(element, 'text') and re.match(r'^Таблица\s*\d+[.:]\s*', element.text, re.IGNORECASE):
-                    # Это заголовок таблицы
                     if current_chunk["content"]:
+                        current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
                         chunks.append(current_chunk.copy())
 
                     last_caption = element.text
                     continue
 
                 # Обычный текст или параграф
-                current_table = None  # Сбрасываем идентификатор таблицы
+                current_table = None
                 text_content = element.text if hasattr(element, 'text') else str(element)
 
                 if current_chunk["type"] == "heading":
-                    # Если предыдущий элемент был заголовком, добавляем текст к нему
+                    # Если предыдущий элемент был заголовком, преобразуем в секцию
+                    logger.debug(f"Преобразуем заголовок в секцию, добавляем текст со страницы {current_page}")
+
                     current_chunk["content"] += "\n\n" + text_content
                     current_chunk["type"] = "section"
+
+                    # Добавляем страницу в set
+                    if current_page:
+                        current_chunk["all_pages"].add(current_page)
+                        logger.debug(
+                            f"Секция '{current_chunk['heading'][:30]}...' теперь содержит страницы: {current_chunk['all_pages']}")
+
                 elif current_chunk["type"] == "section":
-                    # Если уже идет секция, продолжаем добавлять текст
+                    # Продолжаем добавлять к существующей секции
+                    logger.debug(
+                        f"Добавляем к секции '{current_chunk['heading'][:30]}...' текст со страницы {current_page}")
+
                     current_chunk["content"] += "\n\n" + text_content
+
+                    # Добавляем страницу в set
+                    if current_page:
+                        current_chunk["all_pages"].add(current_page)
+                        logger.debug(f"Секция теперь содержит страницы: {current_chunk['all_pages']}")
+
                 else:
                     # Начинаем новый текстовый блок
                     if current_chunk["content"]:
+                        current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
                         chunks.append(current_chunk.copy())
 
                     current_chunk = {
@@ -309,13 +343,15 @@ class SemanticChunker:
                         "type": "paragraph" if element.label == "paragraph" else element.label,
                         "page": current_page,
                         "heading": None,
-                        "table_id": None
+                        "table_id": None,
+                        "all_pages": {current_page} if current_page else set()
                     }
 
             else:
                 # Для всех остальных типов элементов
                 if hasattr(element, 'text') and element.text.strip():
                     if current_chunk["content"]:
+                        current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
                         chunks.append(current_chunk.copy())
 
                     current_chunk = {
@@ -323,17 +359,41 @@ class SemanticChunker:
                         "type": element.label,
                         "page": current_page,
                         "heading": None,
-                        "table_id": None
+                        "table_id": None,
+                        "all_pages": {current_page} if current_page else set()
                     }
 
         # Добавляем последний чанк
         if current_chunk["content"]:
+            current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
             chunks.append(current_chunk)
+
+        # Финальная обработка: преобразуем все set в list
+        for chunk in chunks:
+            if isinstance(chunk.get("all_pages"), set):
+                chunk["all_pages"] = sorted(list(chunk["all_pages"]))
+
+            # Добавляем all_pages для чанков, у которых его нет
+            if "all_pages" not in chunk:
+                if chunk.get("pages"):
+                    chunk["all_pages"] = chunk["pages"] if isinstance(chunk["pages"], list) else [chunk["pages"]]
+                elif chunk.get("page"):
+                    chunk["all_pages"] = [chunk["page"]]
+                else:
+                    chunk["all_pages"] = []
+
+        # Логирование для отладки
+        for i, chunk in enumerate(chunks):
+            if chunk.get("type") == "section":
+                logger.info(f"Секция {i}: '{chunk.get('heading', 'Без заголовка')[:50]}...' "
+                            f"содержит страницы: {chunk.get('all_pages', [])}, "
+                            f"основная страница: {chunk.get('page')}")
 
         logger.info(f"Документ разделен на {len(chunks)} смысловых блоков")
         logger.info(f"Обработано страниц: {sorted(list(pages_encountered))}")
 
         return chunks
+
 
     def post_process_tables(self, chunks: List[Dict]) -> List[Dict]:
         """
@@ -418,21 +478,38 @@ class SemanticChunker:
                 if is_continuation:
                     current_table["content"] += "\n\n" + chunk["content"]
 
-                    # Обновляем страницы
-                    existing_pages = current_table.get("pages", [])
-                    if not isinstance(existing_pages, list):
-                        existing_pages = [existing_pages] if existing_pages else []
+                    # Собираем все страницы
+                    if "all_pages" not in current_table:
+                        current_table["all_pages"] = []
 
-                    curr_page = chunk.get("page")
-                    if curr_page and curr_page not in existing_pages:
-                        existing_pages.append(curr_page)
-                        current_table["pages"] = sorted(existing_pages)
+                    # Добавляем страницы из текущего чанка
+                    if "pages" in chunk and chunk["pages"]:
+                        if isinstance(chunk["pages"], list):
+                            current_table["all_pages"].extend(chunk["pages"])
+                        else:
+                            current_table["all_pages"].append(chunk["pages"])
+                    elif "page" in chunk and chunk["page"]:
+                        current_table["all_pages"].append(chunk["page"])
+
+                    # Убираем дубликаты и сортируем
+                    current_table["all_pages"] = sorted(list(set(current_table["all_pages"])))
+
+                    # Обновляем поле pages для совместимости
+                    current_table["pages"] = current_table["all_pages"]
                 else:
                     # Добавляем предыдущую таблицу и начинаем новую
                     if current_table:
                         processed_chunks.append(current_table)
 
                     current_table = chunk.copy()
+
+                    # Инициализируем all_pages
+                    if "pages" in chunk and chunk["pages"]:
+                        current_table["all_pages"] = chunk["pages"] if isinstance(chunk["pages"], list) else [chunk["pages"]]
+                    elif "page" in chunk and chunk["page"]:
+                        current_table["all_pages"] = [chunk["page"]]
+                    else:
+                        current_table["all_pages"] = []
 
             else:
                 # Обработка нетабличных элементов, которые могут быть продолжением таблицы
@@ -489,14 +566,13 @@ class SemanticChunker:
                         # Объединяем с текущей таблицей
                         current_table["content"] += "\n\n" + content
 
-                        # Обновляем страницы
-                        existing_pages = current_table.get("pages", [])
-                        if not isinstance(existing_pages, list):
-                            existing_pages = [existing_pages] if existing_pages else []
+                        # Обновляем all_pages
+                        if "all_pages" not in current_table:
+                            current_table["all_pages"] = []
 
-                        if curr_page and curr_page not in existing_pages:
-                            existing_pages.append(curr_page)
-                            current_table["pages"] = sorted(existing_pages)
+                        if curr_page and curr_page not in current_table["all_pages"]:
+                            current_table["all_pages"].append(curr_page)
+                            current_table["all_pages"] = sorted(current_table["all_pages"])
 
                         # Пропускаем этот чанк в обработке
                         continue
@@ -504,6 +580,12 @@ class SemanticChunker:
                     # Если это не продолжение, завершаем таблицу
                     processed_chunks.append(current_table)
                     current_table = None
+
+                # Добавляем all_pages для обычных чанков
+                if "page" in chunk and chunk["page"]:
+                    chunk["all_pages"] = [chunk["page"]]
+                else:
+                    chunk["all_pages"] = []
 
                 # Добавляем обычный чанк
                 processed_chunks.append(chunk)
@@ -568,6 +650,14 @@ class SemanticChunker:
 
                     # Объединяем с предыдущей таблицей
                     prev_chunk["content"] += "\n\n" + chunk["content"]
+
+                    # Обновляем all_pages
+                    if "all_pages" not in prev_chunk:
+                        prev_chunk["all_pages"] = []
+                    if chunk_page not in prev_chunk["all_pages"]:
+                        prev_chunk["all_pages"].append(chunk_page)
+                        prev_chunk["all_pages"] = sorted(prev_chunk["all_pages"])
+
                     if "pages" not in prev_chunk:
                         prev_chunk["pages"] = [prev_chunk.get("page")]
                     if chunk_page not in prev_chunk["pages"]:
@@ -594,19 +684,52 @@ class SemanticChunker:
 
     def _merge_page_chunks(self, chunks: List[Dict]) -> Dict:
         """
-        Объединяет чанки с одной страницы
+        Объединяет чанки с одной страницы и собирает все номера страниц
         """
         if not chunks:
             return {}
 
         if len(chunks) == 1:
-            return chunks[0]
+            chunk = chunks[0]
+            # Если у чанка есть поле all_pages, используем его
+            if "all_pages" in chunk and chunk["all_pages"]:
+                pass  # Уже есть all_pages
+            # Если у чанка есть поле pages (для таблиц), используем его
+            elif "pages" in chunk and chunk["pages"]:
+                chunk["all_pages"] = chunk["pages"]
+            # Иначе используем поле page
+            elif "page" in chunk and chunk["page"]:
+                chunk["all_pages"] = [chunk["page"]]
+            else:
+                chunk["all_pages"] = []
+            return chunk
+
+        # Собираем все уникальные страницы из всех чанков
+        all_pages = set()
+
+        for chunk in chunks:
+            # Проверяем поле all_pages
+            if "all_pages" in chunk and chunk["all_pages"]:
+                if isinstance(chunk["all_pages"], list):
+                    all_pages.update(chunk["all_pages"])
+                else:
+                    all_pages.add(chunk["all_pages"])
+            # Проверяем поле pages (для таблиц на нескольких страницах)
+            elif "pages" in chunk and chunk["pages"]:
+                if isinstance(chunk["pages"], list):
+                    all_pages.update(chunk["pages"])
+                else:
+                    all_pages.add(chunk["pages"])
+            # Проверяем поле page
+            elif "page" in chunk and chunk["page"]:
+                all_pages.add(chunk["page"])
 
         # Берем базовую информацию из первого чанка
         merged_chunk = {
             "content": "",
             "type": "merged_page",
-            "page": chunks[0].get("page"),
+            "page": chunks[0].get("page"),  # Оставляем для совместимости
+            "all_pages": sorted(list(all_pages)),  # Список всех страниц
             "heading": None,
             "table_id": None
         }
@@ -679,10 +802,12 @@ class SemanticChunker:
 
         for chunk in grouped_chunks:
             # Добавляем страницы
-            if chunk.get("page"):
-                pages.add(chunk["page"])
+            if "all_pages" in chunk and chunk["all_pages"]:
+                pages.update(chunk["all_pages"])
             elif chunk.get("pages"):
                 pages.update(chunk["pages"])
+            elif chunk.get("page"):
+                pages.add(chunk["page"])
 
             # Подсчитываем типы контента
             chunk_type = chunk.get("type", "unknown")
@@ -697,7 +822,7 @@ class SemanticChunker:
                 page=chunk.get("page"),
                 heading=chunk.get("heading"),
                 table_id=chunk.get("table_id"),
-                pages=chunk.get("pages"),
+                pages=chunk.get("all_pages", chunk.get("pages")),
                 section_path=None  # Можно добавить логику определения section_path
             ))
 
