@@ -19,17 +19,17 @@ class OllamaEmbeddings(Embeddings):
     # Статические настройки по умолчанию
     DEFAULT_OPTIONS = {
         "num_ctx": 8192,      # Максимальный размер контекста
-        "num_keep": 8192,     # Сколько токенов сохранять
-        "num_thread": 2      # Для многопоточной обработки
+        "num_keep": 8192     # Сколько токенов сохранять
+        #"num_thread": 2      # Для многопоточной обработки
         #"use_gpu": True       # Использовать GPU если доступно
     }
 
     def __init__(
             self,
-            model_name: str = "nomic-embed-text",
+            model_name: str = "bge-m3:latest",
             base_url: str = "http://localhost:11434",
             embed_batch_size: int = 10,
-            timeout: int = 60,
+            timeout: int = 600,
             normalize_embeddings: bool = True,
             check_availability: bool = True,
             options: Dict[str, Any] = None,  # Переопределение настроек

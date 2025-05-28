@@ -65,6 +65,7 @@ async def lifespan(app: FastAPI):
 
     # Инициализация Redis с асинхронным клиентом
     redis_client = await redis.from_url("redis://localhost:6379", decode_responses=True)
+    logger.info("Redis клиент инициализирован")
 
     # Инициализация QdrantManager БЕЗ загрузки моделей
     loop = asyncio.get_event_loop()
@@ -81,6 +82,112 @@ async def lifespan(app: FastAPI):
             ollama_keep_alive=OLLAMA_KEEP_ALIVE  # Время хранения модели в памяти из переменной окружения
         )
     )
+    logger.info("QdrantManager инициализирован")
+
+    # СОЗДАНИЕ КОЛЛЕКЦИИ
+    logger.info("Проверка и создание коллекции Qdrant...")
+    try:
+        # Получаем список существующих коллекций
+        collections_response = await loop.run_in_executor(
+            executor,
+            lambda: qdrant_manager.client.get_collections()
+        )
+
+        existing_collections = [c.name for c in collections_response.collections]
+        logger.info(f"Существующие коллекции: {existing_collections}")
+
+        # Проверяем, существует ли наша коллекция
+        if qdrant_manager.collection_name not in existing_collections:
+            logger.info(f"Коллекция '{qdrant_manager.collection_name}' не найдена. Создаем...")
+
+            # Создаем коллекцию
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_collection(
+                    collection_name=qdrant_manager.collection_name,
+                    vectors_config=models.VectorParams(
+                        size=qdrant_manager.vector_size,
+                        distance=models.Distance.COSINE
+                    )
+                )
+            )
+            logger.info(f"Коллекция '{qdrant_manager.collection_name}' создана")
+
+            # Создаем индексы для оптимизации поиска
+            logger.info("Создание индексов...")
+
+            # Индекс для application_id
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_payload_index(
+                    collection_name=qdrant_manager.collection_name,
+                    field_name="metadata.application_id",
+                    field_schema="keyword"
+                )
+            )
+
+            # Индекс для content_type
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_payload_index(
+                    collection_name=qdrant_manager.collection_name,
+                    field_name="metadata.content_type",
+                    field_schema="keyword"
+                )
+            )
+
+            # Полнотекстовый индекс для page_content
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_payload_index(
+                    collection_name=qdrant_manager.collection_name,
+                    field_name="page_content",
+                    field_schema="text"
+                )
+            )
+
+            logger.info("Все индексы созданы успешно")
+
+        else:
+            logger.info(f"Коллекция '{qdrant_manager.collection_name}' уже существует")
+
+            # Опционально: проверяем и создаем недостающие индексы
+            try:
+                collection_info = await loop.run_in_executor(
+                    executor,
+                    lambda: qdrant_manager.client.get_collection(qdrant_manager.collection_name)
+                )
+
+                # Проверяем наличие полнотекстового индекса
+                if hasattr(collection_info, 'payload_schema'):
+                    if 'page_content' not in collection_info.payload_schema:
+                        logger.info("Создание недостающего полнотекстового индекса...")
+                        await loop.run_in_executor(
+                            executor,
+                            lambda: qdrant_manager.client.create_payload_index(
+                                collection_name=qdrant_manager.collection_name,
+                                field_name="page_content",
+                                field_schema="text"
+                            )
+                        )
+                        logger.info("Полнотекстовый индекс создан")
+
+            except Exception as e:
+                logger.warning(f"Не удалось проверить индексы: {e}")
+
+        # Получаем информацию о коллекции
+        collection_info = await loop.run_in_executor(
+            executor,
+            lambda: qdrant_manager.client.get_collection(qdrant_manager.collection_name)
+        )
+
+        logger.info(f"Коллекция готова к работе. Статус: {collection_info.status}, "
+                    f"Векторов: {collection_info.vectors_count}")
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка при создании коллекции: {e}")
+        # Решаем, что делать при ошибке - продолжать или останавливать сервис
+        # raise  # Раскомментировать, если хотим остановить сервис при ошибке
 
     # НЕ инициализируем ререйтер при старте
     logger.info("Сервис запущен. Модели будут загружены при первом использовании.")
@@ -94,22 +201,43 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    logger.info("Начало остановки сервиса...")
+
+    # Отменяем фоновые задачи
     cleanup_task.cancel()
     indexing_worker_task.cancel()
+
     try:
         await cleanup_task
     except asyncio.CancelledError:
         pass
+
     try:
         await indexing_worker_task
     except asyncio.CancelledError:
         pass
 
+    # Ожидаем завершения всех задач в очереди
+    if indexing_queue.qsize() > 0:
+        logger.info(f"Ожидание завершения {indexing_queue.qsize()} задач в очереди...")
+        await indexing_queue.join()
+
+    # Завершаем executor
     executor.shutdown(wait=True)
+
+    # Очищаем ресурсы ререйтера если он был инициализирован
     if reranker:
         await loop.run_in_executor(executor, reranker.cleanup)
         cleanup_gpu_memory()
+
+    # Очищаем ресурсы QdrantManager
+    if qdrant_manager:
+        await loop.run_in_executor(executor, qdrant_manager.cleanup)
+
+    # Закрываем Redis соединение
     await redis_client.close()
+
+    logger.info("Сервис остановлен")
 
 
 app = FastAPI(lifespan=lifespan)
