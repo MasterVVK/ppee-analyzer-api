@@ -97,8 +97,6 @@ class SemanticChunker:
 
         return self._converter
 
-    # Замените метод extract_chunks в классе SemanticChunker
-
     def extract_chunks(self, pdf_path: str) -> List[Dict]:
         """
         Извлекает и структурирует документ по смысловым блокам.
@@ -147,8 +145,10 @@ class SemanticChunker:
                 if hasattr(element, 'text') and element.text.strip():
                     if current_chunk["content"]:
                         # Преобразуем set в sorted list перед добавлением
-                        current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
-                        chunks.append(current_chunk.copy())
+                        chunk_to_add = current_chunk.copy()
+                        if isinstance(chunk_to_add.get("all_pages"), set):
+                            chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
+                        chunks.append(chunk_to_add)
 
                     current_chunk = {
                         "content": element.text,
@@ -166,8 +166,10 @@ class SemanticChunker:
                     re.match(r'^Таблица\s*\d+[.:]', element.text, re.IGNORECASE)):
                 # Это заголовок таблицы
                 if current_chunk["content"] and current_chunk["type"] != "table":
-                    current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
-                    chunks.append(current_chunk.copy())
+                    chunk_to_add = current_chunk.copy()
+                    if isinstance(chunk_to_add.get("all_pages"), set):
+                        chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
+                    chunks.append(chunk_to_add)
 
                 last_caption = element.text if hasattr(element, 'text') else str(element)
                 current_chunk = {
@@ -205,8 +207,10 @@ class SemanticChunker:
 
                 # Всегда создаем новый чанк для таблицы
                 if current_chunk["content"]:
-                    current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
-                    chunks.append(current_chunk.copy())
+                    chunk_to_add = current_chunk.copy()
+                    if isinstance(chunk_to_add.get("all_pages"), set):
+                        chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
+                    chunks.append(chunk_to_add)
 
                 # Создаем чанк для таблицы
                 table_chunk = {
@@ -236,8 +240,10 @@ class SemanticChunker:
             elif element.label == "heading" or element.label == "section_header":
                 # Если это заголовок раздела, начинаем новый чанк
                 if current_chunk["content"]:
-                    current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
-                    chunks.append(current_chunk.copy())
+                    chunk_to_add = current_chunk.copy()
+                    if isinstance(chunk_to_add.get("all_pages"), set):
+                        chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
+                    chunks.append(chunk_to_add)
 
                 current_table = None
                 last_caption = None
@@ -259,8 +265,10 @@ class SemanticChunker:
             elif element.label == "document_index":
                 # Обработка оглавления
                 if current_chunk["content"]:
-                    current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
-                    chunks.append(current_chunk.copy())
+                    chunk_to_add = current_chunk.copy()
+                    if isinstance(chunk_to_add.get("all_pages"), set):
+                        chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
+                    chunks.append(chunk_to_add)
 
                 content = ""
                 if hasattr(element, 'text'):
@@ -297,8 +305,10 @@ class SemanticChunker:
                 # Проверяем, не является ли текст подписью к таблице
                 if hasattr(element, 'text') and re.match(r'^Таблица\s*\d+[.:]\s*', element.text, re.IGNORECASE):
                     if current_chunk["content"]:
-                        current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
-                        chunks.append(current_chunk.copy())
+                        chunk_to_add = current_chunk.copy()
+                        if isinstance(chunk_to_add.get("all_pages"), set):
+                            chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
+                        chunks.append(chunk_to_add)
 
                     last_caption = element.text
                     continue
@@ -335,8 +345,10 @@ class SemanticChunker:
                 else:
                     # Начинаем новый текстовый блок
                     if current_chunk["content"]:
-                        current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
-                        chunks.append(current_chunk.copy())
+                        chunk_to_add = current_chunk.copy()
+                        if isinstance(chunk_to_add.get("all_pages"), set):
+                            chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
+                        chunks.append(chunk_to_add)
 
                     current_chunk = {
                         "content": text_content,
@@ -351,8 +363,10 @@ class SemanticChunker:
                 # Для всех остальных типов элементов
                 if hasattr(element, 'text') and element.text.strip():
                     if current_chunk["content"]:
-                        current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
-                        chunks.append(current_chunk.copy())
+                        chunk_to_add = current_chunk.copy()
+                        if isinstance(chunk_to_add.get("all_pages"), set):
+                            chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
+                        chunks.append(chunk_to_add)
 
                     current_chunk = {
                         "content": element.text,
@@ -365,8 +379,10 @@ class SemanticChunker:
 
         # Добавляем последний чанк
         if current_chunk["content"]:
-            current_chunk["all_pages"] = sorted(list(current_chunk["all_pages"]))
-            chunks.append(current_chunk)
+            chunk_to_add = current_chunk.copy()
+            if isinstance(chunk_to_add.get("all_pages"), set):
+                chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
+            chunks.append(chunk_to_add)
 
         # Финальная обработка: преобразуем все set в list
         for chunk in chunks:
@@ -393,7 +409,6 @@ class SemanticChunker:
         logger.info(f"Обработано страниц: {sorted(list(pages_encountered))}")
 
         return chunks
-
 
     def post_process_tables(self, chunks: List[Dict]) -> List[Dict]:
         """
@@ -582,11 +597,11 @@ class SemanticChunker:
                     current_table = None
 
                 # Добавляем all_pages для обычных чанков
-                if "page" in chunk and chunk["page"]:
-                    chunk["all_pages"] = [chunk["page"]]
-                else:
-                    chunk["all_pages"] = []
-
+                if "all_pages" not in chunk:
+                    if "page" in chunk and chunk["page"]:
+                        chunk["all_pages"] = [chunk["page"]]
+                    else:
+                        chunk["all_pages"] = []
                 # Добавляем обычный чанк
                 processed_chunks.append(chunk)
 
@@ -622,6 +637,13 @@ class SemanticChunker:
                 if re.search(indicator, content.strip()[:100]):
                     return True
             return False
+
+        # ОТЛАДКА: Логируем входные чанки
+        logger.info(f"group_semantic_chunks: получено {len(chunks)} чанков")
+        for i, chunk in enumerate(chunks):
+            if chunk.get("type") == "section":
+                logger.info(f"Входной чанк {i}: секция '{chunk.get('heading', 'Без заголовка')[:30]}...' "
+                            f"имеет all_pages: {chunk.get('all_pages', [])}, page: {chunk.get('page')}")
 
         for i, chunk in enumerate(chunks):
             chunk_page = chunk.get("page")
@@ -665,20 +687,47 @@ class SemanticChunker:
                     prev_chunk["page"] = min(prev_chunk["pages"])  # Обновляем page до минимальной страницы
                     continue
 
+            # ОТЛАДКА для секций
+            if chunk.get("type") == "section":
+                logger.info(f"Обрабатываем секцию '{chunk.get('heading', 'Без заголовка')[:30]}...' "
+                            f"с all_pages: {chunk.get('all_pages', [])}, "
+                            f"количество страниц: {len(chunk.get('all_pages', []))}")
+
+            # ИСПРАВЛЕНИЕ: Проверяем, является ли чанк секцией с несколькими страницами
+            if chunk.get("type") == "section" and chunk.get("all_pages") and len(chunk.get("all_pages", [])) > 1:
+                logger.info(f"Секция с несколькими страницами обнаружена, добавляем без группировки")
+                # Если есть накопленные чанки текущей страницы, сначала их обработаем
+                if current_page_chunks:
+                    grouped_chunks.append(self._merge_page_chunks(current_page_chunks))
+                    current_page_chunks = []
+
+                # Добавляем секцию как отдельный чанк, не группируя
+                grouped_chunks.append(chunk)
+                current_page = None  # Сбрасываем текущую страницу
+
             # Если страница изменилась и есть накопленные чанки
-            if chunk_page != current_page and current_page_chunks:
+            elif chunk_page != current_page and current_page_chunks:
+                logger.debug(f"Страница изменилась с {current_page} на {chunk_page}, группируем накопленные чанки")
                 grouped_chunks.append(self._merge_page_chunks(current_page_chunks))
                 current_page_chunks = [chunk]
                 current_page = chunk_page
 
             # Добавляем чанк к текущей странице
             else:
+                logger.debug(f"Добавляем чанк типа {chunk.get('type')} к странице {current_page}")
                 current_page_chunks.append(chunk)
                 current_page = chunk_page
 
         # Объединяем последнюю страницу
         if current_page_chunks:
             grouped_chunks.append(self._merge_page_chunks(current_page_chunks))
+
+        # ОТЛАДКА: Логируем результат
+        logger.info(f"group_semantic_chunks: результат {len(grouped_chunks)} чанков")
+        for i, chunk in enumerate(grouped_chunks):
+            if chunk.get("type") == "section":
+                logger.info(f"Результат {i}: секция '{chunk.get('heading', 'Без заголовка')[:30]}...' "
+                            f"имеет all_pages: {chunk.get('all_pages', [])}")
 
         return grouped_chunks
 
@@ -688,6 +737,13 @@ class SemanticChunker:
         """
         if not chunks:
             return {}
+
+        # ОТЛАДКА
+        logger.debug(f"_merge_page_chunks: получено {len(chunks)} чанков для объединения")
+        for i, chunk in enumerate(chunks):
+            if chunk.get("type") == "section":
+                logger.info(f"_merge_page_chunks: чанк {i} - секция '{chunk.get('heading', 'Без заголовка')[:30]}...' "
+                            f"с all_pages: {chunk.get('all_pages', [])}")
 
         if len(chunks) == 1:
             chunk = chunks[0]
@@ -702,6 +758,12 @@ class SemanticChunker:
                 chunk["all_pages"] = [chunk["page"]]
             else:
                 chunk["all_pages"] = []
+
+            # ОТЛАДКА
+            if chunk.get("type") == "section":
+                logger.info(f"_merge_page_chunks: возвращаем единственный чанк - секцию "
+                            f"'{chunk.get('heading', 'Без заголовка')[:30]}...' с all_pages: {chunk.get('all_pages', [])}")
+
             return chunk
 
         # Собираем все уникальные страницы из всех чанков
@@ -771,6 +833,10 @@ class SemanticChunker:
             content_parts.extend(section["content"])
 
         merged_chunk["content"] = "\n\n".join(content_parts)
+
+        # ОТЛАДКА
+        logger.info(f"_merge_page_chunks: результат объединения - тип: {merged_chunk['type']}, "
+                    f"all_pages: {merged_chunk['all_pages']}")
 
         return merged_chunk
 

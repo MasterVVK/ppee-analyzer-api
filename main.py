@@ -406,12 +406,20 @@ async def process_document_with_semantic_chunker(document_path: str, application
             processed_chunks = chunker.post_process_tables(chunks)
             grouped_chunks = chunker.group_semantic_chunks(processed_chunks)
 
+            # Добавляем отладочную информацию
+            logger.info(f"Обработка {len(grouped_chunks)} чанков для документа {document_path}")
+
             # Преобразуем в Document объекты
             documents = []
             document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
             document_name = os.path.basename(document_path)
 
             for i, chunk in enumerate(grouped_chunks):
+                # Отладка для секций
+                if chunk.get("type") == "section":
+                    logger.debug(f"Секция '{chunk.get('heading', 'Без заголовка')[:30]}...' "
+                                 f"имеет all_pages: {chunk.get('all_pages', [])}")
+
                 metadata = {
                     "application_id": application_id,
                     "document_id": document_id,
@@ -421,20 +429,35 @@ async def process_document_with_semantic_chunker(document_path: str, application
                     "section": chunk.get("heading", "Не определено"),
                 }
 
-                # Записываем список всех страниц
+                # ИСПРАВЛЕНИЕ: Приоритет отдаем all_pages для ВСЕХ типов чанков
+                pages_list = []
+
+                # Сначала проверяем all_pages - это основное поле для всех страниц
                 if "all_pages" in chunk and chunk["all_pages"]:
+                    pages_list = chunk["all_pages"]
+                    logger.debug(f"Чанк {i} ({chunk.get('type')}): используем all_pages = {pages_list}")
+                # Затем проверяем pages (для совместимости)
+                elif "pages" in chunk and chunk["pages"]:
+                    pages_list = chunk["pages"] if isinstance(chunk["pages"], list) else [chunk["pages"]]
+                    logger.debug(f"Чанк {i} ({chunk.get('type')}): используем pages = {pages_list}")
+                # В крайнем случае используем page
+                elif "page" in chunk and chunk["page"]:
+                    pages_list = [chunk["page"]]
+                    logger.debug(f"Чанк {i} ({chunk.get('type')}): используем page = {pages_list}")
+
+                # Убеждаемся, что pages_list - это список
+                if not isinstance(pages_list, list):
+                    pages_list = [pages_list] if pages_list else []
+
+                # Сохраняем страницы в метаданные
+                if pages_list:
                     # Сохраняем как строку через запятую для удобства поиска
-                    metadata["page_number"] = ",".join(map(str, chunk["all_pages"]))
+                    metadata["page_number"] = ",".join(map(str, sorted(pages_list)))
                     # Также сохраняем как список для удобства обработки
-                    metadata["page_numbers"] = chunk["all_pages"]
-                elif chunk.get("pages") and isinstance(chunk["pages"], list):
-                    # Fallback для поля pages
-                    metadata["page_number"] = ",".join(map(str, chunk["pages"]))
-                    metadata["page_numbers"] = chunk["pages"]
-                elif chunk.get("page"):
-                    # Fallback для старого формата с одной страницей
-                    metadata["page_number"] = str(chunk.get("page"))
-                    metadata["page_numbers"] = [chunk.get("page")]
+                    metadata["page_numbers"] = sorted(pages_list)
+                else:
+                    metadata["page_number"] = ""
+                    metadata["page_numbers"] = []
 
                 documents.append(Document(
                     page_content=chunk.get("content", ""),
@@ -442,6 +465,7 @@ async def process_document_with_semantic_chunker(document_path: str, application
                 ))
 
             return documents
+
         except RuntimeError as e:
             if "meta tensor" in str(e):
                 logger.error(f"Ошибка meta tensor, попытка использовать CPU: {str(e)}")
@@ -458,7 +482,7 @@ async def process_document_with_semantic_chunker(document_path: str, application
                 processed_chunks = chunker.post_process_tables(chunks)
                 grouped_chunks = chunker.group_semantic_chunks(processed_chunks)
 
-                # Преобразуем в Document объекты
+                # Преобразуем в Document объекты (повторяем ту же логику)
                 documents = []
                 document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
                 document_name = os.path.basename(document_path)
@@ -473,20 +497,25 @@ async def process_document_with_semantic_chunker(document_path: str, application
                         "section": chunk.get("heading", "Не определено"),
                     }
 
-                    # Записываем список всех страниц
+                    # Используем ту же логику для страниц
+                    pages_list = []
+
                     if "all_pages" in chunk and chunk["all_pages"]:
-                        # Сохраняем как строку через запятую для удобства поиска
-                        metadata["page_number"] = ",".join(map(str, chunk["all_pages"]))
-                        # Также сохраняем как список для удобства обработки
-                        metadata["page_numbers"] = chunk["all_pages"]
-                    elif chunk.get("pages") and isinstance(chunk["pages"], list):
-                        # Fallback для поля pages
-                        metadata["page_number"] = ",".join(map(str, chunk["pages"]))
-                        metadata["page_numbers"] = chunk["pages"]
-                    elif chunk.get("page"):
-                        # Fallback для старого формата с одной страницей
-                        metadata["page_number"] = str(chunk.get("page"))
-                        metadata["page_numbers"] = [chunk.get("page")]
+                        pages_list = chunk["all_pages"]
+                    elif "pages" in chunk and chunk["pages"]:
+                        pages_list = chunk["pages"] if isinstance(chunk["pages"], list) else [chunk["pages"]]
+                    elif "page" in chunk and chunk["page"]:
+                        pages_list = [chunk["page"]]
+
+                    if not isinstance(pages_list, list):
+                        pages_list = [pages_list] if pages_list else []
+
+                    if pages_list:
+                        metadata["page_number"] = ",".join(map(str, sorted(pages_list)))
+                        metadata["page_numbers"] = sorted(pages_list)
+                    else:
+                        metadata["page_number"] = ""
+                        metadata["page_numbers"] = []
 
                     documents.append(Document(
                         page_content=chunk.get("content", ""),
@@ -516,7 +545,6 @@ async def process_document_with_semantic_chunker(document_path: str, application
                 logger.info("SemanticChunker освобожден из памяти")
 
     return await loop.run_in_executor(executor, _process)
-
 
 # API endpoints
 @app.get("/system/status")
