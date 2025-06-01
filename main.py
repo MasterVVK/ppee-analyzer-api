@@ -257,8 +257,9 @@ class IndexDocumentRequest(BaseModel):
     task_id: str
     application_id: str
     document_path: str
+    document_id: Optional[str] = None  # Добавляем для совместимости
     delete_existing: bool = False
-
+    metadata: Optional[Dict[str, Any]] = None  # Добавляем для передачи file_id
 
 class SearchRequest(BaseModel):
     application_id: str
@@ -386,7 +387,8 @@ async def update_task_status(task_id: str, status: str, progress: int = 0,
     logger.info(f"Task {task_id}: {status} - {progress}% [{stage}] {message}")
 
 
-async def process_document_with_semantic_chunker(document_path: str, application_id: str) -> List[Document]:
+async def process_document_with_semantic_chunker(document_path: str, application_id: str,
+                                                 additional_metadata: Optional[Dict[str, Any]] = None) -> List[Document]:
     """Асинхронно обрабатывает документ с использованием семантического чанкера"""
     loop = asyncio.get_event_loop()
 
@@ -411,7 +413,14 @@ async def process_document_with_semantic_chunker(document_path: str, application
 
             # Преобразуем в Document объекты
             documents = []
-            document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
+
+            # Используем document_id из additional_metadata если передан
+            document_id = None
+            if additional_metadata and 'document_id' in additional_metadata:
+                document_id = additional_metadata['document_id']
+            else:
+                document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
+
             document_name = os.path.basename(document_path)
 
             for i, chunk in enumerate(grouped_chunks):
@@ -429,10 +438,14 @@ async def process_document_with_semantic_chunker(document_path: str, application
                     "section": chunk.get("heading", "Не определено"),
                 }
 
-                # ИСПРАВЛЕНИЕ: Приоритет отдаем all_pages для ВСЕХ типов чанков
+                # ВАЖНО: Добавляем дополнительные метаданные (file_id, index_session_id и т.д.)
+                if additional_metadata:
+                    metadata.update(additional_metadata)
+
+                # Обработка страниц
                 pages_list = []
 
-                # Сначала проверяем all_pages - это основное поле для всех страниц
+                # Сначала проверяем all_pages - это основное поле для ВСЕХ страниц
                 if "all_pages" in chunk and chunk["all_pages"]:
                     pages_list = chunk["all_pages"]
                     logger.debug(f"Чанк {i} ({chunk.get('type')}): используем all_pages = {pages_list}")
@@ -484,7 +497,14 @@ async def process_document_with_semantic_chunker(document_path: str, application
 
                 # Преобразуем в Document объекты (повторяем ту же логику)
                 documents = []
-                document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
+
+                # Используем document_id из additional_metadata если передан
+                document_id = None
+                if additional_metadata and 'document_id' in additional_metadata:
+                    document_id = additional_metadata['document_id']
+                else:
+                    document_id = f"doc_{os.path.basename(document_path).replace(' ', '_').replace('.', '_')}"
+
                 document_name = os.path.basename(document_path)
 
                 for i, chunk in enumerate(grouped_chunks):
@@ -496,6 +516,10 @@ async def process_document_with_semantic_chunker(document_path: str, application
                         "chunk_index": i,
                         "section": chunk.get("heading", "Не определено"),
                     }
+
+                    # Добавляем дополнительные метаданные
+                    if additional_metadata:
+                        metadata.update(additional_metadata)
 
                     # Используем ту же логику для страниц
                     pages_list = []
@@ -668,15 +692,63 @@ async def index_document_task_worker(request: IndexDocumentRequest):
 
         await update_task_status(request.task_id, "PROGRESS", 20, "convert", "Обработка документа...")
 
-        # Обрабатываем документ
-        chunks = await process_document_with_semantic_chunker(request.document_path, request.application_id)
+        # Обрабатываем документ с передачей метаданных
+        chunks = await process_document_with_semantic_chunker(
+            request.document_path,
+            request.application_id,
+            request.metadata  # Передаем дополнительные метаданные
+        )
 
         await update_task_status(request.task_id, "PROGRESS", 50, "index", f"Индексация {len(chunks)} фрагментов...")
 
         # Удаляем старые данные если нужно
         if request.delete_existing:
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(executor, qdrant_manager.delete_application, request.application_id)
+
+            # Если есть file_id в метаданных, удаляем по нему
+            if request.metadata and 'file_id' in request.metadata:
+                # Удаляем чанки конкретного файла
+                from qdrant_client.http import models
+
+                delete_filter = models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="metadata.application_id",
+                            match=models.MatchValue(value=request.application_id)
+                        ),
+                        models.FieldCondition(
+                            key="metadata.file_id",
+                            match=models.MatchValue(value=request.metadata['file_id'])
+                        )
+                    ]
+                )
+
+                # Получаем точки для удаления
+                scroll_result = await loop.run_in_executor(
+                    executor,
+                    lambda: qdrant_manager.client.scroll(
+                        collection_name=qdrant_manager.collection_name,
+                        scroll_filter=delete_filter,
+                        limit=10000,
+                        with_payload=False,
+                        with_vectors=False
+                    )
+                )
+
+                points_to_delete = [point.id for point in scroll_result[0]]
+
+                if points_to_delete:
+                    await loop.run_in_executor(
+                        executor,
+                        lambda: qdrant_manager.client.delete(
+                            collection_name=qdrant_manager.collection_name,
+                            points_selector=models.PointIdsList(points=points_to_delete)
+                        )
+                    )
+                    logger.info(f"Удалено {len(points_to_delete)} старых чанков файла")
+            else:
+                # Старый способ - удаляем все данные заявки
+                await loop.run_in_executor(executor, qdrant_manager.delete_application, request.application_id)
 
         # Индексируем пакетами асинхронно
         total_chunks = len(chunks)
@@ -714,7 +786,7 @@ async def index_document_task_worker(request: IndexDocumentRequest):
             active_indexing_tasks -= 1
             logger.info(f"Индексация завершена. Активных задач: {active_indexing_tasks}")
 
-        # ИЗМЕНЕНИЕ: Убираем агрессивную очистку, оставляем только легкую очистку GPU кэшей
+        # ВАЖНО: Убираем агрессивную очистку, оставляем только легкую очистку GPU кэшей
         cleanup_gpu_memory()
 
 
@@ -1616,6 +1688,186 @@ async def get_system_stats():
             "system": {"process_count": 0, "disk_percent": 0, "active_indexing_tasks": 0, "indexing_queue_size": 0}
         }
 
+# Добавьте эти эндпоинты в ваш FastAPI main.py файл
+
+@app.delete("/applications/{application_id}/files/{file_id}/chunks")
+async def delete_file_chunks(application_id: str, file_id: str):
+    """Удаляет чанки по file_id из метаданных"""
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _delete_chunks():
+            from qdrant_client.http import models
+
+            # Создаем фильтр для удаления чанков конкретного файла
+            delete_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="metadata.application_id",
+                        match=models.MatchValue(value=application_id)
+                    ),
+                    models.FieldCondition(
+                        key="metadata.file_id",
+                        match=models.MatchValue(value=file_id)
+                    )
+                ]
+            )
+
+            # Сначала получаем количество документов для удаления
+            scroll_result = qdrant_manager.client.scroll(
+                collection_name=qdrant_manager.collection_name,
+                scroll_filter=delete_filter,
+                limit=1000,
+                with_payload=False,
+                with_vectors=False
+            )
+
+            points_to_delete = [point.id for point in scroll_result[0]]
+            deleted_count = len(points_to_delete)
+
+            # Удаляем найденные точки
+            if points_to_delete:
+                qdrant_manager.client.delete(
+                    collection_name=qdrant_manager.collection_name,
+                    points_selector=models.PointIdsList(
+                        points=points_to_delete
+                    )
+                )
+
+                logger.info(f"Удалено {deleted_count} чанков файла {file_id} из заявки {application_id}")
+
+            return deleted_count
+
+        deleted_count = await loop.run_in_executor(executor, _delete_chunks)
+
+        return {
+            "status": "success",
+            "deleted_count": deleted_count,
+            "message": f"Удалено {deleted_count} чанков файла {file_id}"
+        }
+
+    except Exception as e:
+        logger.exception(f"Ошибка удаления чанков файла: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/applications/{application_id}/files/{file_id}/stats")
+async def get_file_stats(application_id: str, file_id: str):
+    """Получает статистику по конкретному файлу"""
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _get_stats():
+            from qdrant_client.http import models
+
+            # Создаем фильтр для поиска чанков файла
+            file_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="metadata.application_id",
+                        match=models.MatchValue(value=application_id)
+                    ),
+                    models.FieldCondition(
+                        key="metadata.file_id",
+                        match=models.MatchValue(value=file_id)
+                    )
+                ]
+            )
+
+            # Получаем чанки файла
+            scroll_result = qdrant_manager.client.scroll(
+                collection_name=qdrant_manager.collection_name,
+                scroll_filter=file_filter,
+                limit=1000,
+                with_payload=True,
+                with_vectors=False
+            )
+
+            chunks_count = len(scroll_result[0])
+
+            # Собираем статистику по типам контента
+            content_types = {}
+            for point in scroll_result[0]:
+                if hasattr(point, 'payload') and 'metadata' in point.payload:
+                    content_type = point.payload['metadata'].get('content_type', 'unknown')
+                    content_types[content_type] = content_types.get(content_type, 0) + 1
+
+            return {
+                "chunks_count": chunks_count,
+                "content_types": content_types,
+                "file_id": file_id,
+                "application_id": application_id
+            }
+
+        stats = await loop.run_in_executor(executor, _get_stats)
+
+        return {
+            "status": "success",
+            "chunks_count": stats["chunks_count"],
+            "content_types": stats["content_types"]
+        }
+
+    except Exception as e:
+        logger.exception(f"Ошибка получения статистики файла: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/applications/{application_id}/files")
+async def get_application_files(application_id: str):
+    """Получает список всех файлов в заявке на основе метаданных"""
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _get_files():
+            from qdrant_client.http import models
+
+            # Получаем все чанки заявки
+            scroll_result = qdrant_manager.client.scroll(
+                collection_name=qdrant_manager.collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="metadata.application_id",
+                            match=models.MatchValue(value=application_id)
+                        )
+                    ]
+                ),
+                limit=10000,
+                with_payload=True,
+                with_vectors=False
+            )
+
+            # Собираем уникальные файлы
+            files_info = {}
+            for point in scroll_result[0]:
+                if hasattr(point, 'payload') and 'metadata' in point.payload:
+                    metadata = point.payload['metadata']
+                    file_id = metadata.get('file_id')
+
+                    if file_id and file_id not in files_info:
+                        files_info[file_id] = {
+                            "file_id": file_id,
+                            "document_id": metadata.get('document_id'),
+                            "document_name": metadata.get('document_name', 'Unknown'),
+                            "chunks_count": 0
+                        }
+
+                    if file_id:
+                        files_info[file_id]["chunks_count"] += 1
+
+            return list(files_info.values())
+
+        files = await loop.run_in_executor(executor, _get_files)
+
+        return {
+            "status": "success",
+            "files": files,
+            "total_files": len(files)
+        }
+
+    except Exception as e:
+        logger.exception(f"Ошибка получения списка файлов: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
