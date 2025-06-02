@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 redis_client = None
 qdrant_manager = None
 reranker = None
-executor = ThreadPoolExecutor(max_workers=10)
+executor = ThreadPoolExecutor(max_workers=30)
 reranker_semaphore = None
 reranker_initialized = False  # Флаг инициализации ререйтера
 active_indexing_tasks = 0  # Счетчик активных задач индексации
@@ -1613,82 +1613,145 @@ async def delete_document_chunks(application_id: str, document_id: str):
 async def get_system_stats():
     """Получение статистики использования системных ресурсов"""
     try:
-        # CPU статистика
-        cpu_percent = psutil.cpu_percent(interval=1)
+        loop = asyncio.get_event_loop()
 
-        # Память
-        memory = psutil.virtual_memory()
-        memory_percent = memory.percent
-        memory_used = memory.used / (1024 ** 3)  # В гигабайтах
-        memory_total = memory.total / (1024 ** 3)  # В гигабайтах
+        # Асинхронная функция для получения информации о GPU
+        async def get_gpu_info_async():
+            def _get_gpu_info():
+                try:
+                    gpus = GPUtil.getGPUs()
+                    if gpus:
+                        gpu = gpus[0]  # Берем первую GPU
+                        return {
+                            "name": gpu.name,
+                            "vram_percent": round(gpu.memoryUtil * 100, 1),
+                            "vram_used_gb": round(gpu.memoryUsed / 1024, 2),
+                            "vram_total_gb": round(gpu.memoryTotal / 1024, 2),
+                            "temperature": gpu.temperature,
+                            "utilization": round(gpu.load * 100, 1)
+                        }
+                except Exception as e:
+                    logger.warning(f"Не удалось получить информацию о GPU: {e}")
+                    return None
 
-        # VRAM (GPU память)
-        vram_percent = 0
-        vram_used = 0
-        vram_total = 0
-        gpu_name = "Не обнаружено"
-        gpu_temperature = None
-        gpu_utilization = 0
+            return await loop.run_in_executor(executor, _get_gpu_info)
 
-        try:
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                gpu = gpus[0]  # Берем первую GPU
-                vram_percent = gpu.memoryUtil * 100
-                vram_used = gpu.memoryUsed / 1024  # В гигабайтах
-                vram_total = gpu.memoryTotal / 1024  # В гигабайтах
-                gpu_name = gpu.name
-                gpu_temperature = gpu.temperature
-                gpu_utilization = gpu.load * 100  # Процент использования GPU
-        except Exception as e:
-            logger.warning(f"Не удалось получить информацию о GPU: {e}")
+        # Асинхронная функция для получения CPU процента
+        async def get_cpu_percent_async():
+            def _get_cpu_percent():
+                return psutil.cpu_percent(interval=1)
 
-        # Дополнительная информация о процессах
-        process_count = len(psutil.pids())
+            return await loop.run_in_executor(executor, _get_cpu_percent)
 
-        # Информация о дисках (опционально)
-        disk_usage = psutil.disk_usage('/')
-        disk_percent = disk_usage.percent
+        # Асинхронная функция для получения информации о памяти
+        async def get_memory_info_async():
+            def _get_memory_info():
+                memory = psutil.virtual_memory()
+                return {
+                    "percent": round(memory.percent, 1),
+                    "used_gb": round(memory.used / (1024 ** 3), 2),
+                    "total_gb": round(memory.total / (1024 ** 3), 2),
+                    "available_gb": round(memory.available / (1024 ** 3), 2)
+                }
 
-        return {
+            return await loop.run_in_executor(executor, _get_memory_info)
+
+        # Асинхронная функция для получения информации о дисках
+        async def get_disk_info_async():
+            def _get_disk_info():
+                disk_usage = psutil.disk_usage('/')
+                return round(disk_usage.percent, 1)
+
+            return await loop.run_in_executor(executor, _get_disk_info)
+
+        # Асинхронная функция для подсчета процессов
+        async def get_process_count_async():
+            def _get_process_count():
+                return len(psutil.pids())
+
+            return await loop.run_in_executor(executor, _get_process_count)
+
+        # Асинхронная функция для получения информации о CPU (ядра и потоки)
+        async def get_cpu_static_info_async():
+            def _get_cpu_static_info():
+                return {
+                    "cores": psutil.cpu_count(logical=False),
+                    "threads": psutil.cpu_count(logical=True)
+                }
+
+            return await loop.run_in_executor(executor, _get_cpu_static_info)
+
+        # Запускаем все задачи параллельно с таймаутами
+        tasks = [
+            asyncio.create_task(asyncio.wait_for(get_cpu_percent_async(), timeout=1.5)),
+            asyncio.create_task(asyncio.wait_for(get_memory_info_async(), timeout=0.5)),
+            asyncio.create_task(asyncio.wait_for(get_disk_info_async(), timeout=0.5)),
+            asyncio.create_task(asyncio.wait_for(get_process_count_async(), timeout=0.5)),
+            asyncio.create_task(asyncio.wait_for(get_cpu_static_info_async(), timeout=0.5)),
+            asyncio.create_task(asyncio.wait_for(get_gpu_info_async(), timeout=1.0))
+        ]
+
+        # Ждем завершения всех задач
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Обрабатываем результаты
+        cpu_percent = results[0] if not isinstance(results[0], Exception) else 0
+        memory_info = results[1] if not isinstance(results[1], Exception) else {
+            "percent": 0, "used_gb": 0, "total_gb": 0, "available_gb": 0
+        }
+        disk_percent = results[2] if not isinstance(results[2], Exception) else 0
+        process_count = results[3] if not isinstance(results[3], Exception) else 0
+        cpu_static_info = results[4] if not isinstance(results[4], Exception) else {
+            "cores": 0, "threads": 0
+        }
+        gpu_info = results[5] if not isinstance(results[5], Exception) else None
+
+        # Логируем ошибки, если они были
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                if isinstance(result, asyncio.TimeoutError):
+                    logger.warning(f"Таймаут при выполнении задачи {i}")
+                else:
+                    logger.warning(f"Ошибка при выполнении задачи {i}: {result}")
+
+        # Формируем ответ
+        response = {
             "cpu": {
                 "percent": round(cpu_percent, 1),
-                "cores": psutil.cpu_count(logical=False),
-                "threads": psutil.cpu_count(logical=True)
+                "cores": cpu_static_info.get("cores", 0),
+                "threads": cpu_static_info.get("threads", 0)
             },
-            "memory": {
-                "percent": round(memory_percent, 1),
-                "used_gb": round(memory_used, 2),
-                "total_gb": round(memory_total, 2),
-                "available_gb": round(memory.available / (1024 ** 3), 2)
-            },
-            "gpu": {
-                "name": gpu_name,
-                "vram_percent": round(vram_percent, 1),
-                "vram_used_gb": round(vram_used, 2),
-                "vram_total_gb": round(vram_total, 2),
-                "temperature": gpu_temperature,
-                "utilization": round(gpu_utilization, 1)
+            "memory": memory_info,
+            "gpu": gpu_info or {
+                "name": "Не обнаружено",
+                "vram_percent": 0,
+                "vram_used_gb": 0,
+                "vram_total_gb": 0,
+                "temperature": None,
+                "utilization": 0
             },
             "system": {
                 "process_count": process_count,
-                "disk_percent": round(disk_percent, 1),
+                "disk_percent": disk_percent,
                 "active_indexing_tasks": active_indexing_tasks,
                 "indexing_queue_size": indexing_queue.qsize() if indexing_queue else 0
             }
         }
+
+        return response
+
     except Exception as e:
-        logger.error(f"Ошибка при получении системной статистики: {e}")
+        logger.error(f"Критическая ошибка при получении системной статистики: {e}")
+        # Возвращаем минимальную статистику вместо ошибки
         return {
             "error": str(e),
             "cpu": {"percent": 0, "cores": 0, "threads": 0},
             "memory": {"percent": 0, "used_gb": 0, "total_gb": 0, "available_gb": 0},
-            "gpu": {"name": "Ошибка", "vram_percent": 0, "vram_used_gb": 0, "vram_total_gb": 0, "temperature": None,
-                    "utilization": 0},
-            "system": {"process_count": 0, "disk_percent": 0, "active_indexing_tasks": 0, "indexing_queue_size": 0}
+            "gpu": {"name": "Ошибка", "vram_percent": 0, "vram_used_gb": 0,
+                    "vram_total_gb": 0, "temperature": None, "utilization": 0},
+            "system": {"process_count": 0, "disk_percent": 0,
+                      "active_indexing_tasks": 0, "indexing_queue_size": 0}
         }
-
-# Добавьте эти эндпоинты в ваш FastAPI main.py файл
 
 @app.delete("/applications/{application_id}/files/{file_id}/chunks")
 async def delete_file_chunks(application_id: str, file_id: str):
