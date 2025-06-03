@@ -690,7 +690,7 @@ async def index_document_task_worker(request: IndexDocumentRequest):
         if not os.path.exists(request.document_path):
             raise FileNotFoundError(f"Файл не найден: {request.document_path}")
 
-        await update_task_status(request.task_id, "PROGRESS", 20, "convert", "Обработка документа...")
+        await update_task_status(request.task_id, "PROGRESS", 10, "convert", "Конвертация документа...")
 
         # Обрабатываем документ с передачей метаданных
         chunks = await process_document_with_semantic_chunker(
@@ -699,7 +699,8 @@ async def index_document_task_worker(request: IndexDocumentRequest):
             request.metadata  # Передаем дополнительные метаданные
         )
 
-        await update_task_status(request.task_id, "PROGRESS", 50, "index", f"Индексация {len(chunks)} фрагментов...")
+        # ИСПРАВЛЕНО: Добавляем этап "split" после обработки
+        await update_task_status(request.task_id, "PROGRESS", 30, "split", f"Разделение на {len(chunks)} фрагментов...")
 
         # Удаляем старые данные если нужно
         if request.delete_existing:
@@ -750,6 +751,9 @@ async def index_document_task_worker(request: IndexDocumentRequest):
                 # Старый способ - удаляем все данные заявки
                 await loop.run_in_executor(executor, qdrant_manager.delete_application, request.application_id)
 
+        # ИСПРАВЛЕНО: Обновляем прогресс перед индексацией
+        await update_task_status(request.task_id, "PROGRESS", 50, "index", f"Индексация {len(chunks)} фрагментов...")
+
         # Индексируем пакетами асинхронно
         total_chunks = len(chunks)
         batch_size = 20
@@ -762,9 +766,20 @@ async def index_document_task_worker(request: IndexDocumentRequest):
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(executor, qdrant_manager.add_documents, batch)
 
-            progress = 50 + int(45 * (end_idx / total_chunks))
-            await update_task_status(request.task_id, "PROGRESS", progress, "index",
+            # ИСПРАВЛЕНО: Корректируем расчет прогресса и этапа
+            progress = 50 + int(40 * (end_idx / total_chunks))  # От 50% до 90%
+
+            # Определяем этап в зависимости от прогресса
+            if progress < 90:
+                stage = "index"
+            else:
+                stage = "complete"
+
+            await update_task_status(request.task_id, "PROGRESS", progress, stage,
                                      f"Индексация: {end_idx}/{total_chunks}...")
+
+        # ИСПРАВЛЕНО: Финальное обновление
+        await update_task_status(request.task_id, "PROGRESS", 95, "complete", "Завершение индексации...")
 
         # Успешное завершение
         result = {
@@ -786,7 +801,7 @@ async def index_document_task_worker(request: IndexDocumentRequest):
             active_indexing_tasks -= 1
             logger.info(f"Индексация завершена. Активных задач: {active_indexing_tasks}")
 
-        # ВАЖНО: Убираем агрессивную очистку, оставляем только легкую очистку GPU кэшей
+        # Убираем агрессивную очистку, оставляем только легкую очистку GPU кэшей
         cleanup_gpu_memory()
 
 
