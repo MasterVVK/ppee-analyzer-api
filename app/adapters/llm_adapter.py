@@ -447,7 +447,7 @@ class OllamaLLMProvider(LLMProvider):
                 "prompt": full_prompt,
                 "stream": False,
                 "options": options,
-                "keep_alive": "10s"
+                "keep_alive": "5s"
             }
 
             # Отправляем запрос

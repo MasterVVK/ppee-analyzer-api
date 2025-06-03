@@ -16,7 +16,7 @@ class BGEReranker:
         self,
         model_name: str = "BAAI/bge-reranker-v2-m3",
         device: str = "cuda",
-        batch_size: int = 8,
+        batch_size: int = 2,
         max_length: int = 8192,
         min_vram_mb: int = 500  # Минимальное количество свободной VRAM в МБ
     ):
