@@ -1028,7 +1028,6 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
         await update_task_status(request.task_id, "PROGRESS", 10, "prepare", "Инициализация анализа...")
 
         loop = asyncio.get_event_loop()
-        #analyzer = ChecklistAnalyzer(qdrant_manager)
         processed_count = 0
         error_count = 0
         total_items = len(request.checklist_items)
@@ -1104,7 +1103,7 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                     # Форматируем контекст
                     context = "\n\n".join([doc.page_content for doc in search_documents])
 
-                    # ВАЖНО: Формируем полный промпт здесь
+                    # Формируем полный промпт здесь
                     full_prompt = item['llm_prompt_template'].replace(
                         "{query}", query
                     ).replace(
@@ -1138,8 +1137,8 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                                            for res in search_results],
                         "search_method": search_method,
                         "llm_request": {
-                            'prompt': full_prompt,  # Сохраняем ПОЛНЫЙ промпт
-                            'prompt_template': item['llm_prompt_template'],  # И шаблон для справки
+                            'prompt': full_prompt,  # Сохраняем полный промпт
+                            'prompt_template': item['llm_prompt_template'],  # Шаблон для справки
                             'model': item['llm_model'],
                             'temperature': item.get('llm_temperature', 0.1),
                             'max_tokens': item.get('llm_max_tokens', 1000),
@@ -1151,6 +1150,15 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                         }
                     })
                     processed_count += 1
+
+                    # ВАЖНО: Сохраняем промежуточные результаты в Redis после каждого параметра
+                    await redis_client.setex(
+                        f"task_results:{request.task_id}",
+                        3600,  # TTL 1 час
+                        json.dumps({"results": results})
+                    )
+                    logger.info(f"Сохранены промежуточные результаты в Redis: {len(results)} параметров")
+
                 else:
                     results.append({
                         "parameter_id": item['id'],
@@ -1187,7 +1195,7 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
         # Освобождаем кэши после завершения анализа
         cleanup_gpu_memory()
 
-        # Завершение
+        # Завершение - сохраняем финальные результаты
         result = {
             "status": "success",
             "processed": processed_count,
@@ -1195,6 +1203,13 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
             "total": total_items,
             "results": results
         }
+
+        # Сохраняем финальные результаты в Redis
+        await redis_client.setex(
+            f"task_results:{request.task_id}",
+            3600,  # TTL 1 час
+            json.dumps({"results": results})
+        )
 
         await update_task_status(request.task_id, "SUCCESS", 100, "complete",
                                  "Анализ завершен", result)
@@ -1519,23 +1534,30 @@ async def get_task_status_plural(task_id: str):
 @app.get("/tasks/{task_id}/results")
 async def get_task_results(task_id: str):
     """Получает результаты выполненной задачи"""
+    # Сначала пробуем получить из отдельного ключа результатов
+    results_data = await redis_client.get(f"task_results:{task_id}")
+    if results_data:
+        return json.loads(results_data)
+
+    # Если нет результатов в отдельном ключе, проверяем основной ключ задачи
     task_data = await redis_client.get(f"task:{task_id}")
     if not task_data:
         raise HTTPException(status_code=404, detail="Task not found")
 
     data = json.loads(task_data)
 
-    # Проверяем, что задача завершена успешно
-    if data.get("status") != "SUCCESS":
-        raise HTTPException(status_code=400, detail=f"Task not completed. Status: {data.get('status')}")
+    # ИЗМЕНЕНО: Проверяем статус, но разрешаем PROGRESS для промежуточных результатов
+    status = data.get("status")
+    if status not in ["SUCCESS", "PROGRESS"]:
+        # Для обратной совместимости возвращаем ошибку 400 для других статусов
+        raise HTTPException(status_code=400, detail=f"Task not completed. Status: {status}")
 
-    # Возвращаем результаты
-    result = data.get("result", {})
-    return {
-        "status": "success",
-        "task_id": task_id,
-        "results": result.get("results", []) if isinstance(result, dict) else []
-    }
+    # Извлекаем результаты из данных задачи
+    if "result" in data and isinstance(data["result"], dict):
+        results = data["result"].get("results", [])
+        return {"results": results}
+
+    return {"results": []}
 
 
 @app.get("/task/{task_id}/results")
