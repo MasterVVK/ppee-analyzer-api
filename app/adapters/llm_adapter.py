@@ -454,7 +454,7 @@ class OllamaLLMProvider(LLMProvider):
             response = requests.post(
                 f"{self.base_url}/api/generate",
                 json=payload,
-                timeout=2200  # Увеличенный таймаут для сложных запросов
+                timeout=2300  # Увеличенный таймаут для сложных запросов
             )
 
             # Проверяем ответ
