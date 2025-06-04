@@ -16,7 +16,7 @@ class BGEReranker:
         self,
         model_name: str = "BAAI/bge-reranker-v2-m3",
         device: str = "cuda",
-        batch_size: int = 1,
+        batch_size: int = 8,
         max_length: int = 8192,
         min_vram_mb: int = 500  # Минимальное количество свободной VRAM в МБ
     ):
@@ -129,10 +129,6 @@ class BGEReranker:
 
             # Определяем доступную память, используя наиболее консервативную оценку
             if nvidia_smi_info and torch_info:
-                # Учитываем как данные nvidia-smi, так и torch.cuda
-                # nvidia-smi дает информацию о свободной памяти на уровне системы
-                # torch.cuda дает информацию о памяти, которую может использовать текущий процесс
-
                 # Берем минимум из двух значений для консервативной оценки
                 free_mem_mb = min(
                     nvidia_smi_info["free_mb"],
@@ -140,7 +136,6 @@ class BGEReranker:
                 )
 
                 # Учитываем уже зарезервированную PyTorch память
-                # Если зарезервированная память больше, чем аллоцированная, вычитаем разницу
                 if torch_info["reserved_mb"] > torch_info["allocated_mb"]:
                     free_mem_mb -= (torch_info["reserved_mb"] - torch_info["allocated_mb"])
 
@@ -266,24 +261,20 @@ class BGEReranker:
                 logger.error(f"Критическая ошибка при переключении на CPU: {str(e)}")
                 raise RuntimeError(f"Не удалось переключить модель на CPU: {str(e)}")
 
-    def rerank(
-        self,
-        query: str,
-        documents: List[Dict[str, Any]],
-        top_k: int = None,
-        text_key: str = "text"
-    ) -> List[Dict[str, Any]]:
+    def rerank(self, query: str, documents: List[Dict[str, Any]],
+               top_k: int = None, text_key: str = "text") -> List[Dict[str, Any]]:
         """
-        Выполняет ре-ранкинг списка документов.
+        Переранжирует документы по релевантности к запросу.
+        После использования освобождает VRAM путем очистки кэшей.
 
         Args:
             query: Поисковый запрос
-            documents: Список документов (словарей с ключом 'text' или указанным в text_key)
-            top_k: Количество документов в возвращаемом результате (None - все)
-            text_key: Ключ, по которому извлекается текстовое содержимое документа
+            documents: Список документов для ререйтинга
+            top_k: Количество документов в результате (None - все)
+            text_key: Ключ для извлечения текста из документа
 
         Returns:
-            List[Dict[str, Any]]: Отсортированный список документов с добавленной оценкой rerank_score
+            List[Dict[str, Any]]: Отсортированный список документов с rerank_score
         """
         if not documents:
             return []
@@ -291,42 +282,110 @@ class BGEReranker:
         if top_k is None:
             top_k = len(documents)
 
-        logger.info(f"Выполнение ре-ранкинга для {len(documents)} документов на устройстве {self.device}")
-
-        # Если использование GPU, проверяем доступность VRAM
-        if self.device == "cuda" and not self._check_vram_availability(self.min_vram_mb):
-            logger.warning(f"Недостаточно VRAM перед ре-ранкингом. Переключаемся на CPU")
-            self._fallback_to_cpu()
-
-        # Получаем тексты документов
-        texts = [doc.get(text_key, "") for doc in documents]
-
         try:
+            # Переносим модель на GPU если она на CPU
+            if self.device == "cuda" and next(self.model.parameters()).device.type == 'cpu':
+                logger.info("Переносим модель ререйтера на GPU...")
+                try:
+                    self.model = self.model.to('cuda')
+                    logger.info("Модель успешно перенесена на GPU")
+                except RuntimeError as e:
+                    logger.error(f"Не удалось перенести модель на GPU: {e}")
+                    logger.info("Продолжаем работу на CPU")
+
+            # Определяем текущее устройство модели
+            current_device = next(self.model.parameters()).device.type
+            logger.info(f"Выполнение ре-ранкинга для {len(documents)} документов на устройстве {current_device}")
+
+            # Извлекаем тексты из документов
+            texts = []
+            for doc in documents:
+                text = doc.get(text_key, "")
+                if not text:
+                    # Пробуем альтернативные ключи
+                    text = doc.get("content", "") or doc.get("page_content", "")
+                texts.append(text)
+
             # Вычисляем оценки релевантности
-            scores = self._compute_scores(query, texts)
-        except RuntimeError as e:
-            # Если ошибка связана с CUDA и мы используем GPU
-            if "CUDA out of memory" in str(e) and self.device != "cpu":
-                logger.warning(f"Ошибка CUDA при ре-ранкинге: {str(e)}")
-
-                # Переключаемся на CPU и повторяем попытку
-                self._fallback_to_cpu()
-
-                # Повторно вычисляем оценки
+            try:
                 scores = self._compute_scores(query, texts)
-            else:
-                # Если ошибка не связана с CUDA или мы уже на CPU, пробрасываем её дальше
-                raise
+            except RuntimeError as e:
+                # Если ошибка CUDA out of memory
+                if "CUDA out of memory" in str(e) and current_device == "cuda":
+                    logger.warning(f"Ошибка CUDA при ре-ранкинге: {str(e)}")
+                    logger.info("Недостаточно памяти GPU, используем fallback на CPU...")
 
-        # Добавляем оценки ре-ранкинга к документам
-        for i, score in enumerate(scores):
-            documents[i]["rerank_score"] = float(score)
+                    # Временно переносим на CPU только для этого запроса
+                    self.model = self.model.to('cpu')
+                    torch.cuda.empty_cache()
 
-        # Сортируем документы по убыванию оценки ре-ранкинга
-        reranked_documents = sorted(documents, key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+                    # Повторяем вычисление на CPU
+                    scores = self._compute_scores(query, texts)
 
-        # Возвращаем top_k документов
-        return reranked_documents[:top_k]
+                    # НЕ возвращаем на GPU - пусть следующий запрос решит
+                else:
+                    # Другая ошибка - пробрасываем дальше
+                    raise
+
+            # Добавляем оценки к документам
+            for i, score in enumerate(scores):
+                documents[i]["rerank_score"] = float(score)
+
+            # Сортируем документы по убыванию оценки
+            reranked_documents = sorted(
+                documents,
+                key=lambda x: x.get("rerank_score", 0.0),
+                reverse=True
+            )
+
+            # Логируем статистику
+            if len(reranked_documents) > 0:
+                max_score = reranked_documents[0].get("rerank_score", 0)
+                min_score = reranked_documents[-1].get("rerank_score", 0)
+                logger.info(f"Ре-ранкинг завершен. Оценки: max={max_score:.4f}, min={min_score:.4f}")
+
+            # Возвращаем top_k документов
+            result = reranked_documents[:top_k]
+            logger.info(f"Возвращено {len(result)} документов из {len(documents)}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Ошибка при ре-ранкинге: {str(e)}")
+            # В случае ошибки возвращаем исходные документы
+            return documents[:top_k]
+
+        finally:
+            # Переносим модель на CPU для освобождения VRAM
+            if self.device == "cuda" and hasattr(self, 'model') and self.model is not None:
+                try:
+                    current_device = next(self.model.parameters()).device.type
+
+                    if current_device == "cuda":
+                        logger.info("Освобождаем VRAM, переносим модель на CPU...")
+
+                        # Важно: сначала синхронизируем все операции
+                        torch.cuda.synchronize()
+
+                        # Переносим модель на CPU
+                        self.model = self.model.to('cpu')
+
+                        # Ждем немного для завершения переноса
+                        import time
+                        time.sleep(0.05)  # 50ms задержка
+
+                        # Теперь очищаем кэш
+                        torch.cuda.empty_cache()
+
+                        # Проверяем освобожденную память
+                        if torch.cuda.is_available():
+                            allocated_after = torch.cuda.memory_allocated() / (1024**2)
+                            logger.info(f"VRAM после переноса на CPU: {allocated_after:.1f} MB (должно быть ~0)")
+
+                        logger.info("Модель перенесена на CPU, VRAM освобождена")
+
+                except Exception as e:
+                    logger.error(f"Ошибка при переносе модели на CPU: {str(e)}")
 
     def _compute_scores(self, query: str, texts: List[str]) -> List[float]:
         """
@@ -346,6 +405,9 @@ class BGEReranker:
             batch_texts = texts[i:i + self.batch_size]
 
             try:
+                # Определяем устройство модели
+                model_device = next(self.model.parameters()).device
+
                 # Подготавливаем входные данные для модели
                 features = self.tokenizer(
                     [query] * len(batch_texts),
@@ -354,15 +416,24 @@ class BGEReranker:
                     truncation=True,
                     max_length=self.max_length,
                     return_tensors="pt"
-                ).to(self.device)
+                ).to(model_device)
 
                 # Отключаем вычисление градиентов
                 with torch.no_grad():
                     outputs = self.model(**features)
                     batch_scores = outputs.logits.squeeze(-1)
 
-                # Добавляем оценки батча к общему списку
-                scores.extend(batch_scores.cpu().tolist())
+                # Обрабатываем результаты в зависимости от размера батча
+                if self.batch_size == 1 and len(batch_texts) == 1:
+                    # При batch_size=1 squeeze убирает все измерения, возвращая скаляр
+                    # Преобразуем в список с одним элементом
+                    if batch_scores.dim() == 0:  # Скаляр
+                        scores.append(float(batch_scores.item()))
+                    else:  # Тензор с одним элементом
+                        scores.append(float(batch_scores[0].item()))
+                else:
+                    # Для батчей больше 1 используем tolist()
+                    scores.extend(batch_scores.cpu().tolist())
 
             except RuntimeError as e:
                 # Если ошибка CUDA и мы на GPU, переключаемся на CPU
@@ -387,8 +458,14 @@ class BGEReranker:
                         outputs = self.model(**features)
                         batch_scores = outputs.logits.squeeze(-1)
 
-                    # Добавляем оценки батча к общему списку
-                    scores.extend(batch_scores.cpu().tolist())
+                    # Обрабатываем результаты
+                    if self.batch_size == 1 and len(batch_texts) == 1:
+                        if batch_scores.dim() == 0:
+                            scores.append(float(batch_scores.item()))
+                        else:
+                            scores.append(float(batch_scores[0].item()))
+                    else:
+                        scores.extend(batch_scores.cpu().tolist())
                 else:
                     # Другой тип ошибки - пробрасываем дальше
                     raise

@@ -101,6 +101,7 @@ async def lifespan(app: FastAPI):
             logger.info(f"Коллекция '{qdrant_manager.collection_name}' не найдена. Создаем...")
 
             # Создаем коллекцию
+            from qdrant_client.http import models
             await loop.run_in_executor(
                 executor,
                 lambda: qdrant_manager.client.create_collection(
@@ -357,6 +358,8 @@ async def get_reranker():
                         lambda: BGEReranker(
                             model_name="BAAI/bge-reranker-v2-m3",
                             device="cuda",
+                            batch_size=1,  # ВАЖНО: Используем batch_size=1 для экономии памяти
+                            max_length=8192,
                             min_vram_mb=500
                         )
                     )
@@ -897,13 +900,11 @@ def vector_search(application_id: str, query: str, limit: int,
                 try:
                     results = current_reranker.rerank(query, results, top_k=limit, text_key="text")
                 finally:
-                    # ВАЖНО: Освобождаем только кэши после ререйтинга
-                    cleanup_gpu_memory()
+                    # Ререйтер сам освобождает память в своем finally блоке
+                    pass
 
         return results[:limit]
     except Exception as e:
-        # При ошибке тоже освобождаем кэши
-        cleanup_gpu_memory()
         raise
 
 
@@ -963,13 +964,11 @@ def hybrid_search(application_id: str, query: str, limit: int,
                 try:
                     combined = current_reranker.rerank(query, combined, top_k=limit, text_key="text")
                 finally:
-                    # ВАЖНО: Освобождаем только кэши после ререйтинга
-                    cleanup_gpu_memory()
+                    # Ререйтер сам освобождает память в своем finally блоке
+                    pass
 
         return combined[:limit]
     except Exception as e:
-        # При ошибке тоже освобождаем кэши
-        cleanup_gpu_memory()
         raise
 
 
@@ -1032,7 +1031,7 @@ def get_document_key(doc: Dict) -> str:
 
 @app.post("/analyze")
 async def analyze_application(request: AnalyzeApplicationRequest):
-#    Запускает асинхронный анализ заявки
+    """Запускает асинхронный анализ заявки"""
     asyncio.create_task(analyze_application_task(request))
     return {"status": "started", "task_id": request.task_id}
 
