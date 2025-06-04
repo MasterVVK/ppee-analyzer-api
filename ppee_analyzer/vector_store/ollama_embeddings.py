@@ -29,11 +29,11 @@ class OllamaEmbeddings(Embeddings):
             model_name: str = "bge-m3:latest",
             base_url: str = "http://localhost:11434",
             embed_batch_size: int = 10,
-            timeout: int = 600,
+            timeout: int = 1200,
             normalize_embeddings: bool = True,
             check_availability: bool = True,
             options: Dict[str, Any] = None,  # Переопределение настроек
-            keep_alive: str = "10s"  # Время хранения модели в памяти
+            keep_alive: str = "5s"  # Время хранения модели в памяти
     ):
         """
         Инициализирует класс для работы с эмбеддингами Ollama.
