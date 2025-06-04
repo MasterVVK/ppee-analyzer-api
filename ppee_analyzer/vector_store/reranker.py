@@ -61,6 +61,22 @@ class BGEReranker:
             logger.error(f"Ошибка при загрузке модели: {str(e)}")
             raise RuntimeError(f"Не удалось загрузить модель {model_name}: {str(e)}")
 
+    def _try_return_to_gpu(self) -> bool:
+        """Пытается вернуть модель на GPU если возможно"""
+        if (self.requested_device == "cuda" and
+            next(self.model.parameters()).device.type == "cpu" and
+            self._check_vram_availability(self.min_vram_mb + 200)):  # +200MB запас
+
+            try:
+                logger.info("Достаточно VRAM, возвращаем модель на GPU...")
+                self.model = self.model.to('cuda')
+                torch.cuda.empty_cache()
+                logger.info("Модель успешно возвращена на GPU")
+                return True
+            except Exception as e:
+                logger.warning(f"Не удалось вернуть модель на GPU: {e}")
+        return False
+
     def _check_vram_availability(self, min_free_mb: int = 500) -> bool:
         """
         Проверяет доступность VRAM для работы ререйтинга.
@@ -215,14 +231,18 @@ class BGEReranker:
 
         return total_memory
 
-    def _fallback_to_cpu(self) -> None:
+    def _fallback_to_cpu(self, permanent: bool = True) -> None:
         """
         Переключает модель на CPU при проблемах с VRAM.
-        Освобождает ресурсы GPU и перезагружает модель при необходимости.
+
+        Args:
+            permanent: Если True, изменяет self.device навсегда
         """
         if self.device != "cpu":
-            logger.warning(f"Переключение модели {self.model_name} с {self.device} на CPU")
-            self.device = "cpu"
+            logger.warning(f"Переключение модели {self.model_name} с {self.device} на CPU (permanent={permanent})")
+
+            if permanent:
+                self.device = "cpu"  # Изменяем навсегда только если permanent=True
 
             try:
                 # Фиксируем имя модели перед удалением объектов
@@ -283,11 +303,17 @@ class BGEReranker:
             top_k = len(documents)
 
         try:
+            # Проверяем, можно ли вернуться на GPU
+            if self.requested_device == "cuda":
+                current_device = next(self.model.parameters()).device.type
+                if current_device == "cpu":
+                    self._try_return_to_gpu()
+
             # Переносим модель на GPU если она на CPU
             if self.device == "cuda" and next(self.model.parameters()).device.type == 'cpu':
                 logger.info("Переносим модель ререйтера на GPU...")
                 try:
-                    self.model = self.model.to('cuda')
+                    self.model = self.model.to(self.device)
                     logger.info("Модель успешно перенесена на GPU")
                 except RuntimeError as e:
                     logger.error(f"Не удалось перенести модель на GPU: {e}")
@@ -306,6 +332,9 @@ class BGEReranker:
                     text = doc.get("content", "") or doc.get("page_content", "")
                 texts.append(text)
 
+            # Флаг для отслеживания временного переключения на CPU
+            self._should_try_gpu_return = False
+
             # Вычисляем оценки релевантности
             try:
                 scores = self._compute_scores(query, texts)
@@ -313,16 +342,19 @@ class BGEReranker:
                 # Если ошибка CUDA out of memory
                 if "CUDA out of memory" in str(e) and current_device == "cuda":
                     logger.warning(f"Ошибка CUDA при ре-ранкинге: {str(e)}")
-                    logger.info("Недостаточно памяти GPU, используем fallback на CPU...")
+                    logger.info("Недостаточно памяти GPU, временно используем CPU...")
 
                     # Временно переносим на CPU только для этого запроса
                     self.model = self.model.to('cpu')
                     torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
 
                     # Повторяем вычисление на CPU
                     scores = self._compute_scores(query, texts)
 
-                    # НЕ возвращаем на GPU - пусть следующий запрос решит
+                    # Помечаем, что нужно попробовать вернуться на GPU в finally
+                    self._should_try_gpu_return = True
+
                 else:
                     # Другая ошибка - пробрасываем дальше
                     raise
@@ -387,6 +419,21 @@ class BGEReranker:
                 except Exception as e:
                     logger.error(f"Ошибка при переносе модели на CPU: {str(e)}")
 
+            # Пробуем вернуться на GPU если была временная ошибка памяти
+            if (hasattr(self, '_should_try_gpu_return') and
+                self._should_try_gpu_return and
+                self.requested_device == "cuda"):
+
+                # Ждем немного для освобождения памяти другими процессами
+                import time
+                time.sleep(0.1)
+
+                # Пробуем вернуться на GPU
+                if self._try_return_to_gpu():
+                    logger.info("Модель успешно возвращена на GPU после временной нехватки памяти")
+
+                self._should_try_gpu_return = False
+
     def _compute_scores(self, query: str, texts: List[str]) -> List[float]:
         """
         Вычисляет оценки релевантности между запросом и текстами.
@@ -416,7 +463,10 @@ class BGEReranker:
                     truncation=True,
                     max_length=self.max_length,
                     return_tensors="pt"
-                ).to(model_device)
+                )
+
+                # Явно перемещаем каждый тензор на нужное устройство
+                features = {k: v.to(model_device) for k, v in features.items()}
 
                 # Отключаем вычисление градиентов
                 with torch.no_grad():
@@ -451,7 +501,10 @@ class BGEReranker:
                         truncation=True,
                         max_length=self.max_length,
                         return_tensors="pt"
-                    ).to(self.device)  # теперь self.device - это "cpu"
+                    )
+
+                    # Явно перемещаем каждый тензор на CPU
+                    features = {k: v.to('cpu') for k, v in features.items()}
 
                     # Вычисляем оценки
                     with torch.no_grad():
