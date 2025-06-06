@@ -479,6 +479,9 @@ class OllamaLLMProvider(LLMProvider):
                 return f"Ошибка: {error_msg}"
 
             answer = result.get("response", "")
+            # Удаляем служебные токены Gemma
+            answer = answer.replace("</start_of_turn>", "")
+            answer = answer.replace("</end_of_turn>", "")
 
             # Проверяем, содержит ли ответ блоки <think>
             import re

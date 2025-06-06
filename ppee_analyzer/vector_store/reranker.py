@@ -4,6 +4,7 @@
 
 import logging
 import torch
+import time
 from typing import List, Dict, Any, Tuple
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
@@ -267,7 +268,6 @@ class BGEReranker:
                     torch.cuda.empty_cache()
 
                 # Ждем небольшое время для освобождения ресурсов
-                import time
                 time.sleep(1)
 
                 # Заново инициализируем модель и токенизатор на CPU
@@ -303,7 +303,7 @@ class BGEReranker:
             top_k = len(documents)
 
         try:
-            # Проверяем, можно ли вернуться на GPU
+            # Проверяем и пытаемся вернуться на GPU если нужно
             if self.requested_device == "cuda":
                 current_device = next(self.model.parameters()).device.type
                 if current_device == "cpu":
@@ -342,18 +342,40 @@ class BGEReranker:
                 # Если ошибка CUDA out of memory
                 if "CUDA out of memory" in str(e) and current_device == "cuda":
                     logger.warning(f"Ошибка CUDA при ре-ранкинге: {str(e)}")
-                    logger.info("Недостаточно памяти GPU, временно используем CPU...")
 
-                    # Временно переносим на CPU только для этого запроса
-                    self.model = self.model.to('cpu')
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
+                    # ДОБАВЛЕНО: Ждем освобождения памяти
+                    logger.info("Ожидаем освобождения VRAM...")
+                    max_attempts = 5
+                    wait_time = 2  # секунды
 
-                    # Повторяем вычисление на CPU
-                    scores = self._compute_scores(query, texts)
+                    for attempt in range(max_attempts):
+                        # Очищаем кэш
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
 
-                    # Помечаем, что нужно попробовать вернуться на GPU в finally
-                    self._should_try_gpu_return = True
+                        # Ждем
+                        time.sleep(wait_time)
+
+                        # Проверяем доступность памяти
+                        if self._check_vram_availability(self.min_vram_mb):
+                            logger.info(f"VRAM освободилась после {attempt + 1} попыток")
+                            try:
+                                # Пробуем снова на GPU
+                                scores = self._compute_scores(query, texts)
+                                break
+                            except RuntimeError as retry_error:
+                                if "CUDA out of memory" in str(retry_error):
+                                    logger.warning(f"Попытка {attempt + 1} не удалась")
+                                    continue
+                                else:
+                                    raise
+                    else:
+                        # Если все попытки исчерпаны - переходим на CPU
+                        logger.info("VRAM не освободилась, используем CPU...")
+                        self.model = self.model.to('cpu')
+                        torch.cuda.empty_cache()
+                        scores = self._compute_scores(query, texts)
+                        self._should_try_gpu_return = True
 
                 else:
                     # Другая ошибка - пробрасываем дальше
@@ -403,7 +425,6 @@ class BGEReranker:
                         self.model = self.model.to('cpu')
 
                         # Ждем немного для завершения переноса
-                        import time
                         time.sleep(0.05)  # 50ms задержка
 
                         # Теперь очищаем кэш
@@ -425,7 +446,6 @@ class BGEReranker:
                 self.requested_device == "cuda"):
 
                 # Ждем немного для освобождения памяти другими процессами
-                import time
                 time.sleep(0.1)
 
                 # Пробуем вернуться на GPU
@@ -447,9 +467,14 @@ class BGEReranker:
         """
         scores = []
 
+        # Добавляем логирование для отладки
+        logger.info(f"Начало вычисления scores для {len(texts)} текстов, batch_size={self.batch_size}")
+        total_batches = (len(texts) + self.batch_size - 1) // self.batch_size
+
         # Обрабатываем тексты батчами
-        for i in range(0, len(texts), self.batch_size):
+        for batch_idx, i in enumerate(range(0, len(texts), self.batch_size)):
             batch_texts = texts[i:i + self.batch_size]
+            logger.debug(f"Обработка батча {batch_idx + 1}/{total_batches}, размер={len(batch_texts)}")
 
             try:
                 # Определяем устройство модели
@@ -490,38 +515,73 @@ class BGEReranker:
                 if "CUDA out of memory" in str(e) and self.device != "cpu":
                     logger.warning(f"Ошибка CUDA при обработке батча {i}: {str(e)}")
 
-                    # Переключаемся на CPU
-                    self._fallback_to_cpu()
+                    # ДОБАВЛЕНО: Ждем освобождения памяти перед fallback на CPU
+                    logger.info("Ожидаем освобождения VRAM для батча...")
 
-                    # Подготавливаем входные данные заново для CPU
-                    features = self.tokenizer(
-                        [query] * len(batch_texts),
-                        batch_texts,
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_length,
-                        return_tensors="pt"
-                    )
+                    for attempt in range(3):  # 3 попытки
+                        torch.cuda.empty_cache()
+                        time.sleep(2)
 
-                    # Явно перемещаем каждый тензор на CPU
-                    features = {k: v.to('cpu') for k, v in features.items()}
+                        if self._check_vram_availability(self.min_vram_mb):
+                            try:
+                                # Пробуем снова
+                                with torch.no_grad():
+                                    outputs = self.model(**features)
+                                    batch_scores = outputs.logits.squeeze(-1)
 
-                    # Вычисляем оценки
-                    with torch.no_grad():
-                        outputs = self.model(**features)
-                        batch_scores = outputs.logits.squeeze(-1)
-
-                    # Обрабатываем результаты
-                    if self.batch_size == 1 and len(batch_texts) == 1:
-                        if batch_scores.dim() == 0:
-                            scores.append(float(batch_scores.item()))
-                        else:
-                            scores.append(float(batch_scores[0].item()))
+                                # Успешно - обрабатываем результаты
+                                if self.batch_size == 1 and len(batch_texts) == 1:
+                                    if batch_scores.dim() == 0:
+                                        scores.append(float(batch_scores.item()))
+                                    else:
+                                        scores.append(float(batch_scores[0].item()))
+                                else:
+                                    scores.extend(batch_scores.cpu().tolist())
+                                break
+                            except RuntimeError:
+                                continue
                     else:
-                        scores.extend(batch_scores.cpu().tolist())
+                        # Только после неудачных попыток переключаемся на CPU
+                        self._fallback_to_cpu()
+
+                        # ИСПРАВЛЕНИЕ: Подготавливаем входные данные ЗАНОВО после перезагрузки модели
+                        # Это критически важно, так как _fallback_to_cpu() удаляет и пересоздает модель и токенизатор
+                        features = self.tokenizer(
+                            [query] * len(batch_texts),
+                            batch_texts,
+                            padding=True,
+                            truncation=True,
+                            max_length=self.max_length,
+                            return_tensors="pt"
+                        )
+
+                        # Явно перемещаем каждый тензор на CPU (модель теперь на CPU после fallback)
+                        features = {k: v.to('cpu') for k, v in features.items()}
+
+                        # Вычисляем оценки
+                        with torch.no_grad():
+                            outputs = self.model(**features)
+                            batch_scores = outputs.logits.squeeze(-1)
+
+                        # Обрабатываем результаты (используем тот же код для консистентности)
+                        if self.batch_size == 1 and len(batch_texts) == 1:
+                            if batch_scores.dim() == 0:
+                                scores.append(float(batch_scores.item()))
+                            else:
+                                scores.append(float(batch_scores[0].item()))
+                        else:
+                            scores.extend(batch_scores.cpu().tolist())
                 else:
                     # Другой тип ошибки - пробрасываем дальше
                     raise
+
+        # В конце метода проверяем корректность
+        logger.info(f"Вычисление scores завершено. Получено {len(scores)} оценок для {len(texts)} текстов")
+
+        # Проверка корректности
+        if len(scores) != len(texts):
+            logger.error(f"ОШИБКА: Количество scores ({len(scores)}) не совпадает с количеством текстов ({len(texts)})")
+            raise ValueError(f"Несоответствие количества scores и текстов: {len(scores)} != {len(texts)}")
 
         return scores
 
