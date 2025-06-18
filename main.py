@@ -432,6 +432,10 @@ async def process_document_with_semantic_chunker(document_path: str, application
                     logger.debug(f"Секция '{chunk.get('heading', 'Без заголовка')[:30]}...' "
                                  f"имеет all_pages: {chunk.get('all_pages', [])}")
 
+                # Получаем контент
+                content = chunk.get("content", "")
+                content_length = len(content.strip())
+
                 metadata = {
                     "application_id": application_id,
                     "document_id": document_id,
@@ -439,6 +443,9 @@ async def process_document_with_semantic_chunker(document_path: str, application
                     "content_type": chunk.get("type", "unknown"),
                     "chunk_index": i,
                     "section": chunk.get("heading", "Не определено"),
+                    # Добавляем метки
+                    "is_empty": content_length < 10,
+                    "content_length": content_length
                 }
 
                 # ВАЖНО: Добавляем дополнительные метаданные (file_id, index_session_id и т.д.)
@@ -476,7 +483,7 @@ async def process_document_with_semantic_chunker(document_path: str, application
                     metadata["page_numbers"] = []
 
                 documents.append(Document(
-                    page_content=chunk.get("content", ""),
+                    page_content=content,  # Используем оригинальный контент как есть
                     metadata=metadata
                 ))
 
@@ -511,6 +518,9 @@ async def process_document_with_semantic_chunker(document_path: str, application
                 document_name = os.path.basename(document_path)
 
                 for i, chunk in enumerate(grouped_chunks):
+                    content = chunk.get("content", "")
+                    content_length = len(content.strip())
+
                     metadata = {
                         "application_id": application_id,
                         "document_id": document_id,
@@ -518,6 +528,8 @@ async def process_document_with_semantic_chunker(document_path: str, application
                         "content_type": chunk.get("type", "unknown"),
                         "chunk_index": i,
                         "section": chunk.get("heading", "Не определено"),
+                        "is_empty": content_length < 10,
+                        "content_length": content_length
                     }
 
                     # Добавляем дополнительные метаданные
@@ -545,7 +557,7 @@ async def process_document_with_semantic_chunker(document_path: str, application
                         metadata["page_numbers"] = []
 
                     documents.append(Document(
-                        page_content=chunk.get("content", ""),
+                        page_content=content,  # Используем оригинальный контент
                         metadata=metadata
                     ))
 
