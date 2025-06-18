@@ -147,31 +147,70 @@ async def lifespan(app: FastAPI):
                 )
             )
 
+            # НОВЫЕ ИНДЕКСЫ ДЛЯ ФИЛЬТРАЦИИ ПУСТЫХ ЧАНКОВ
+            # Индекс для фильтрации пустых чанков
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_payload_index(
+                    collection_name=qdrant_manager.collection_name,
+                    field_name="metadata.is_empty",
+                    field_schema="bool"
+                )
+            )
+            logger.info("Индекс для metadata.is_empty создан")
+
+            # Индекс для фильтрации по длине контента
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_payload_index(
+                    collection_name=qdrant_manager.collection_name,
+                    field_name="metadata.content_length",
+                    field_schema="integer"
+                )
+            )
+            logger.info("Индекс для metadata.content_length создан")
+
             logger.info("Все индексы созданы успешно")
 
         else:
             logger.info(f"Коллекция '{qdrant_manager.collection_name}' уже существует")
 
-            # Опционально: проверяем и создаем недостающие индексы
+            # Проверяем и создаем недостающие индексы
             try:
                 collection_info = await loop.run_in_executor(
                     executor,
                     lambda: qdrant_manager.client.get_collection(qdrant_manager.collection_name)
                 )
 
+                # Список необходимых индексов
+                required_indices = {
+                    "metadata.application_id": "keyword",
+                    "metadata.content_type": "keyword",
+                    "page_content": "text",
+                    "metadata.is_empty": "bool",
+                    "metadata.content_length": "integer"
+                }
+
                 # Проверяем наличие полнотекстового индекса
                 if hasattr(collection_info, 'payload_schema'):
-                    if 'page_content' not in collection_info.payload_schema:
-                        logger.info("Создание недостающего полнотекстового индекса...")
-                        await loop.run_in_executor(
-                            executor,
-                            lambda: qdrant_manager.client.create_payload_index(
-                                collection_name=qdrant_manager.collection_name,
-                                field_name="page_content",
-                                field_schema="text"
-                            )
-                        )
-                        logger.info("Полнотекстовый индекс создан")
+                    existing_indices = set(collection_info.payload_schema.keys()) if collection_info.payload_schema else set()
+
+                    # Создаем недостающие индексы
+                    for field_name, field_schema in required_indices.items():
+                        if field_name not in existing_indices:
+                            logger.info(f"Создание недостающего индекса для {field_name}...")
+                            try:
+                                await loop.run_in_executor(
+                                    executor,
+                                    lambda fn=field_name, fs=field_schema: qdrant_manager.client.create_payload_index(
+                                        collection_name=qdrant_manager.collection_name,
+                                        field_name=fn,
+                                        field_schema=fs
+                                    )
+                                )
+                                logger.info(f"Индекс для {field_name} создан")
+                            except Exception as idx_error:
+                                logger.warning(f"Не удалось создать индекс для {field_name}: {idx_error}")
 
             except Exception as e:
                 logger.warning(f"Не удалось проверить индексы: {e}")

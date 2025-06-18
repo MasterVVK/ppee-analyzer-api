@@ -191,7 +191,8 @@ class QdrantManager:
             self,
             query: str,
             filter_dict: Optional[Dict[str, Any]] = None,
-            k: int = 3
+            k: int = 3,
+            exclude_empty: bool = True  # Новый параметр
     ) -> List[Document]:
         """
         Выполняет семантический поиск в векторном хранилище.
@@ -200,6 +201,7 @@ class QdrantManager:
             query: Текст запроса
             filter_dict: Словарь для фильтрации
             k: Количество результатов
+            exclude_empty: Исключать ли пустые чанки из результатов
 
         Returns:
             List[Document]: Список найденных документов
@@ -208,9 +210,10 @@ class QdrantManager:
         processed_query = f"query: {query}" if "bge" in self.model_name.lower() else query
 
         # Форматирование фильтра для Qdrant
-        filter_obj = None
+        conditions = []
+
+        # Добавляем существующие фильтры из filter_dict
         if filter_dict:
-            conditions = []
             for key, value in filter_dict.items():
                 conditions.append(
                     models.FieldCondition(
@@ -218,11 +221,23 @@ class QdrantManager:
                         match=models.MatchValue(value=value)
                     )
                 )
-            if conditions:
-                filter_obj = models.Filter(must=conditions)
+
+        # Добавляем фильтр для исключения пустых чанков
+        if exclude_empty:
+            conditions.append(
+                models.FieldCondition(
+                    key="metadata.is_empty",
+                    match=models.MatchValue(value=False)
+                )
+            )
+
+        # Создаем объект фильтра только если есть условия
+        filter_obj = None
+        if conditions:
+            filter_obj = models.Filter(must=conditions)
 
         # Выполнение поиска
-        search_results = self.vector_store.similarity_search_with_score(  # Используем property
+        search_results = self.vector_store.similarity_search_with_score(
             query=processed_query,
             filter=filter_obj,
             k=k

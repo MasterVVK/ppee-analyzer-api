@@ -460,7 +460,8 @@ class QdrantAdapter:
                query: str,
                limit: int = 5,
                rerank_limit: int = None,
-               use_reranker: bool = None) -> List[Dict[str, Any]]:
+               use_reranker: bool = None,
+               include_empty: bool = False) -> List[Dict[str, Any]]:
         """
         Выполняет семантический поиск с опциональным ре-ранкингом.
 
@@ -470,6 +471,7 @@ class QdrantAdapter:
             limit: Количество результатов
             rerank_limit: Количество документов для ре-ранкинга (None - все найденные)
             use_reranker: Переопределение параметра self.use_reranker
+            include_empty: Включать ли пустые чанки в результаты
 
         Returns:
             List[Dict[str, Any]]: Результаты поиска
@@ -478,7 +480,7 @@ class QdrantAdapter:
             # Определяем, использовать ли ререйтинг (приоритет у переданного параметра)
             apply_reranker = use_reranker if use_reranker is not None else self.use_reranker
 
-            logger.info(f"Выполнение поиска '{query}' для заявки {application_id} (ререйтинг: {apply_reranker})")
+            logger.info(f"Выполнение поиска '{query}' для заявки {application_id} (ререйтинг: {apply_reranker}, пустые чанки: {'включены' if include_empty else 'исключены'})")
 
             # Увеличиваем limit для ре-ранкинга
             search_limit = limit
@@ -488,11 +490,12 @@ class QdrantAdapter:
             elif rerank_limit is not None:
                 search_limit = rerank_limit
 
-            # Выполняем поиск
+            # Выполняем поиск с фильтрацией пустых чанков
             docs = self.qdrant_manager.search(
                 query=query,
                 filter_dict={"application_id": application_id},
-                k=search_limit
+                k=search_limit,
+                exclude_empty=not include_empty  # По умолчанию исключаем пустые
             )
 
             # Преобразуем результаты
@@ -557,7 +560,8 @@ class QdrantAdapter:
     def text_search(self,
                     application_id: str,
                     query: str,
-                    limit: int = 5) -> List[Dict[str, Any]]:
+                    limit: int = 5,
+                    min_content_length: int = 10) -> List[Dict[str, Any]]:
         """
         Выполняет полнотекстовый поиск.
 
@@ -565,6 +569,7 @@ class QdrantAdapter:
             application_id: ID заявки
             query: Поисковый запрос
             limit: Количество результатов
+            min_content_length: Минимальная длина контента для фильтрации
 
         Returns:
             List[Dict[str, Any]]: Результаты поиска
@@ -572,7 +577,7 @@ class QdrantAdapter:
         try:
             logger.info(f"Выполнение текстового поиска '{query}' для заявки {application_id}")
 
-            # Создаем комбинированный фильтр для заявки и текстового поиска
+            # Создаем комбинированный фильтр
             combined_filter = models.Filter(
                 must=[
                     models.FieldCondition(
@@ -582,12 +587,19 @@ class QdrantAdapter:
                     models.FieldCondition(
                         key="page_content",
                         match=models.MatchText(text=query)
+                    ),
+                    # Фильтруем по минимальной длине контента
+                    models.FieldCondition(
+                        key="metadata.content_length",
+                        range=models.Range(
+                            gte=min_content_length
+                        )
                     )
                 ]
             )
 
-            # Получаем результаты через scroll
-            results = self.qdrant_manager.client.scroll(
+            # Выполняем поиск по тексту
+            points = self.qdrant_manager.client.scroll(
                 collection_name=self.qdrant_manager.collection_name,
                 scroll_filter=combined_filter,
                 limit=limit,
@@ -596,26 +608,36 @@ class QdrantAdapter:
             )[0]
 
             # Преобразуем результаты
-            formatted_results = []
-            for i, point in enumerate(results):
-                if "payload" in point.__dict__:
-                    # Получаем текст и метаданные
-                    text = point.payload.get("page_content", "")
-                    metadata = point.payload.get("metadata", {})
+            results = []
+            for point in points:
+                # Извлекаем метаданные
+                metadata = point.payload.get("metadata", {})
 
-                    # Добавляем искусственную оценку для текстового поиска
-                    score = 1.0 - (i * 0.05)
-                    if score < 0.1:
-                        score = 0.1
+                # Вычисляем простой счет релевантности на основе количества вхождений
+                text_content = point.payload.get("page_content", "")
+                query_lower = query.lower()
+                text_lower = text_content.lower()
 
-                    formatted_results.append({
-                        "text": text,
-                        "metadata": metadata,
-                        "score": score,
-                        "search_type": "text"
-                    })
+                # Подсчитываем количество вхождений
+                match_count = text_lower.count(query_lower)
 
-            return formatted_results[:limit]
+                # Базовый счет на основе количества совпадений
+                relevance_score = min(match_count / 10.0, 1.0)  # Нормализуем до [0, 1]
+
+                results.append({
+                    "text": text_content,
+                    "metadata": metadata,
+                    "score": relevance_score,
+                    "search_type": "text",
+                    "match_count": match_count
+                })
+
+            # Сортируем по релевантности
+            results.sort(key=lambda x: x["score"], reverse=True)
+
+            logger.info(f"Найдено {len(results)} результатов текстового поиска")
+
+            return results[:limit]
 
         except Exception as e:
             logger.error(f"Ошибка при текстовом поиске: {str(e)}")
