@@ -461,7 +461,8 @@ class QdrantAdapter:
                limit: int = 5,
                rerank_limit: int = None,
                use_reranker: bool = None,
-               include_empty: bool = False) -> List[Dict[str, Any]]:
+               include_empty: bool = False,
+               apply_content_weight: bool = True) -> List[Dict[str, Any]]:
         """
         Выполняет семантический поиск с опциональным ре-ранкингом.
 
@@ -472,6 +473,7 @@ class QdrantAdapter:
             rerank_limit: Количество документов для ре-ранкинга (None - все найденные)
             use_reranker: Переопределение параметра self.use_reranker
             include_empty: Включать ли пустые чанки в результаты
+            apply_content_weight: Применять ли веса контента к результатам
 
         Returns:
             List[Dict[str, Any]]: Результаты поиска
@@ -480,7 +482,9 @@ class QdrantAdapter:
             # Определяем, использовать ли ререйтинг (приоритет у переданного параметра)
             apply_reranker = use_reranker if use_reranker is not None else self.use_reranker
 
-            logger.info(f"Выполнение поиска '{query}' для заявки {application_id} (ререйтинг: {apply_reranker}, пустые чанки: {'включены' if include_empty else 'исключены'})")
+            logger.info(f"Выполнение поиска '{query}' для заявки {application_id} "
+                       f"(ререйтинг: {apply_reranker}, пустые чанки: {'включены' if include_empty else 'исключены'}, "
+                       f"веса контента: {'применяются' if apply_content_weight else 'не применяются'})")
 
             # Увеличиваем limit для ре-ранкинга
             search_limit = limit
@@ -490,23 +494,31 @@ class QdrantAdapter:
             elif rerank_limit is not None:
                 search_limit = rerank_limit
 
-            # Выполняем поиск с фильтрацией пустых чанков
+            # Выполняем поиск с фильтрацией пустых чанков и применением весов
             docs = self.qdrant_manager.search(
                 query=query,
                 filter_dict={"application_id": application_id},
                 k=search_limit,
-                exclude_empty=not include_empty  # По умолчанию исключаем пустые
+                exclude_empty=not include_empty,  # По умолчанию исключаем пустые
+                apply_content_weight=apply_content_weight  # Применяем веса контента
             )
 
             # Преобразуем результаты
             results = []
             for doc in docs:
-                results.append({
+                result_item = {
                     "text": doc.page_content,
                     "metadata": doc.metadata,
-                    "score": doc.metadata.get('score', 0.0),  # Оценка векторного поиска
+                    "score": doc.metadata.get('score', 0.0),  # Уже с учетом весов, если apply_content_weight=True
                     "search_type": "vector"
-                })
+                }
+
+                # Добавляем информацию о весах, если они применялись
+                if apply_content_weight and 'weight_applied' in doc.metadata:
+                    result_item["content_weight"] = doc.metadata.get('weight_applied', 1.0)
+                    result_item["original_score"] = doc.metadata.get('original_score', result_item["score"])
+
+                results.append(result_item)
 
             # Применяем ре-ранкинг, если он включен
             if apply_reranker and hasattr(self, 'reranker') and results:
@@ -550,6 +562,7 @@ class QdrantAdapter:
                     return results[:limit]
             else:
                 return results[:limit]
+
         except Exception as e:
             logger.error(f"Ошибка при поиске: {str(e)}")
             # В случае ошибки тоже освобождаем ресурсы
@@ -649,7 +662,8 @@ class QdrantAdapter:
                       limit: int = 5,
                       vector_weight: float = 0.5,
                       text_weight: float = 0.5,
-                      use_reranker: bool = False) -> List[Dict[str, Any]]:
+                      use_reranker: bool = False,
+                      apply_content_weight: bool = True) -> List[Dict[str, Any]]:
         """
         Выполняет гибридный поиск (комбинация векторного и текстового).
 
@@ -660,6 +674,7 @@ class QdrantAdapter:
             vector_weight: Вес векторного поиска (от 0 до 1)
             text_weight: Вес текстового поиска (от 0 до 1)
             use_reranker: Применять ререйтинг к результатам поиска
+            apply_content_weight: Применять ли веса контента к результатам
 
         Returns:
             List[Dict[str, Any]]: Результаты поиска
@@ -667,15 +682,17 @@ class QdrantAdapter:
         try:
             logger.info(f"Выполнение гибридного поиска '{query}' для заявки {application_id}")
             logger.info(
-                f"Параметры: vector_weight={vector_weight}, text_weight={text_weight}, use_reranker={use_reranker}")
+                f"Параметры: vector_weight={vector_weight}, text_weight={text_weight}, "
+                f"use_reranker={use_reranker}, apply_content_weight={apply_content_weight}")
 
-            # Получаем результаты векторного поиска (без ререйтинга)
+            # Получаем результаты векторного поиска (без ререйтинга, но с весами контента)
             vector_results = self.search(
                 application_id=application_id,
                 query=query,
                 limit=limit * 2,  # Запрашиваем больше результатов для объединения
                 rerank_limit=None,
-                use_reranker=False  # Важно: отключаем ререйтинг для векторного поиска
+                use_reranker=False,  # Важно: отключаем ререйтинг для векторного поиска
+                apply_content_weight=apply_content_weight  # Применяем веса контента
             )
 
             # Получаем результаты текстового поиска
@@ -685,14 +702,21 @@ class QdrantAdapter:
                 limit=limit * 2
             )
 
-            # Объединяем результаты
-            combined_results = self._combine_results(vector_results, text_results,
-                                                     vector_weight, text_weight, limit)
+            # Объединяем результаты с учетом весов контента
+            combined_results = self._combine_results_with_weights(
+                vector_results,
+                text_results,
+                vector_weight,
+                text_weight,
+                limit,
+                apply_content_weight
+            )
 
             # Проверка результатов перед ререйтингом
             for i, doc in enumerate(combined_results[:3]):  # Логируем первые 3 для примера
-                logger.info(f"Документ {i}: наличие поля 'text': {'text' in doc}, "
-                            f"длина текста: {len(doc.get('text', ''))}")
+                logger.debug(f"Документ {i}: наличие поля 'text': {'text' in doc}, "
+                            f"длина текста: {len(doc.get('text', ''))}, "
+                            f"финальный score: {doc.get('score', 0):.4f}")
 
             # Применяем ререйтинг к объединенным результатам, если нужно
             if use_reranker and self.use_reranker and combined_results:
@@ -720,6 +744,104 @@ class QdrantAdapter:
             if use_reranker and self.use_reranker:
                 self.cleanup()
             return []
+
+
+    def _combine_results_with_weights(self,
+                                     vector_results: List[Dict],
+                                     text_results: List[Dict],
+                                     vector_weight: float,
+                                     text_weight: float,
+                                     limit: int,
+                                     apply_content_weight: bool) -> List[Dict[str, Any]]:
+        """
+        Объединяет результаты векторного и текстового поиска с учетом весов контента.
+
+        Args:
+            vector_results: Результаты векторного поиска
+            text_results: Результаты текстового поиска
+            vector_weight: Вес векторного поиска
+            text_weight: Вес текстового поиска
+            limit: Максимальное количество результатов
+            apply_content_weight: Учитывать ли веса контента
+
+        Returns:
+            List[Dict[str, Any]]: Объединенные результаты
+        """
+        # Нормализуем веса
+        total_weight = vector_weight + text_weight
+        vector_weight = vector_weight / total_weight
+        text_weight = text_weight / total_weight
+
+        # Создаем словарь для объединения результатов
+        results_dict = {}
+
+        # Добавляем векторные результаты
+        for doc in vector_results:
+            doc_key = self._get_document_key(doc)
+
+            # Для векторных результатов веса контента уже применены в score
+            # если apply_content_weight=True при вызове search()
+            score = doc.get("score", 0.0) * vector_weight
+
+            results_dict[doc_key] = {
+                "doc": doc,
+                "score": score,
+                "search_type": "hybrid",
+                "vector_score": doc.get("score", 0.0),
+                "text_score": 0.0
+            }
+
+        # Добавляем текстовые результаты
+        for doc in text_results:
+            doc_key = self._get_document_key(doc)
+
+            # Получаем вес контента для текстовых результатов
+            content_weight = 1.0
+            if apply_content_weight:
+                content_weight = doc.get("metadata", {}).get("content_weight", 1.0)
+
+            # Применяем вес контента к текстовому score
+            text_score = doc.get("score", 0.0) * text_weight * content_weight
+
+            if doc_key in results_dict:
+                # Если документ уже есть, обновляем оценку
+                results_dict[doc_key]["score"] += text_score
+                results_dict[doc_key]["text_score"] = doc.get("score", 0.0)
+            else:
+                # Иначе добавляем новый документ
+                results_dict[doc_key] = {
+                    "doc": doc,
+                    "score": text_score,
+                    "search_type": "hybrid",
+                    "vector_score": 0.0,
+                    "text_score": doc.get("score", 0.0)
+                }
+
+        # Сортируем и ограничиваем количество
+        sorted_results = sorted(results_dict.values(),
+                                key=lambda x: x["score"], reverse=True)[:limit]
+
+        # Логируем количество результатов
+        logger.info(f"Объединенные результаты: найдено {len(sorted_results)} элементов после объединения и сортировки")
+
+        # Конвертируем обратно в список результатов
+        combined_results = []
+        for item in sorted_results:
+            doc = item["doc"].copy()
+            doc["score"] = item["score"]
+            doc["search_type"] = "hybrid"
+            doc["vector_score_component"] = item["vector_score"]
+            doc["text_score_component"] = item["text_score"]
+
+            # ВАЖНО: Убедимся, что есть поле text для ререйтинга
+            if "text" not in doc and "content" in doc:
+                doc["text"] = doc["content"]
+            elif "text" not in doc and "page_content" in doc:
+                doc["text"] = doc["page_content"]
+
+            combined_results.append(doc)
+
+        return combined_results
 
     def _combine_results(self,
                          vector_results: List[Dict],

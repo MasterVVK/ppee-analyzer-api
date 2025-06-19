@@ -192,7 +192,8 @@ class QdrantManager:
             query: str,
             filter_dict: Optional[Dict[str, Any]] = None,
             k: int = 3,
-            exclude_empty: bool = True  # Новый параметр
+            exclude_empty: bool = True,
+            apply_content_weight: bool = True  # Новый параметр
     ) -> List[Document]:
         """
         Выполняет семантический поиск в векторном хранилище.
@@ -202,6 +203,7 @@ class QdrantManager:
             filter_dict: Словарь для фильтрации
             k: Количество результатов
             exclude_empty: Исключать ли пустые чанки из результатов
+            apply_content_weight: Применять ли веса контента к score
 
         Returns:
             List[Document]: Список найденных документов
@@ -236,19 +238,47 @@ class QdrantManager:
         if conditions:
             filter_obj = models.Filter(must=conditions)
 
+        # Если применяем веса, получаем больше результатов для пересортировки
+        search_k = k if not apply_content_weight else min(k * 3, 100)
+
         # Выполнение поиска
         search_results = self.vector_store.similarity_search_with_score(
             query=processed_query,
             filter=filter_obj,
-            k=k
+            k=search_k
         )
 
-        # Преобразование результатов с сохранением scores
+        # Преобразование результатов с применением весов
         documents = []
         for doc, score in search_results:
-            # Добавляем score в метаданные
-            doc.metadata['score'] = float(score)
+            # Получаем вес контента (по умолчанию 1.0 для старых документов)
+            content_weight = doc.metadata.get('content_weight', 1.0)
+
+            # Применяем вес к score
+            if apply_content_weight:
+                adjusted_score = float(score) * content_weight
+                doc.metadata['score'] = adjusted_score
+                doc.metadata['original_score'] = float(score)
+                doc.metadata['weight_applied'] = content_weight
+            else:
+                doc.metadata['score'] = float(score)
+
             documents.append(doc)
+
+        # Если применяли веса, нужно пересортировать и взять только k результатов
+        if apply_content_weight and len(documents) > k:
+            # Сортируем по убыванию score
+            documents.sort(key=lambda x: x.metadata['score'], reverse=True)
+            documents = documents[:k]
+
+        # Логируем информацию о применении весов
+        if apply_content_weight:
+            weight_stats = {
+                'total_found': len(search_results),
+                'returned': len(documents),
+                'weights_applied': [doc.metadata.get('weight_applied', 1.0) for doc in documents[:5]]  # Первые 5 для примера
+            }
+            logger.debug(f"Применены веса контента: {weight_stats}")
 
         return documents
 

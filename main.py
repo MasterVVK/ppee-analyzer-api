@@ -188,7 +188,8 @@ async def lifespan(app: FastAPI):
                     "metadata.content_type": "keyword",
                     "page_content": "text",
                     "metadata.is_empty": "bool",
-                    "metadata.content_length": "integer"
+                    "metadata.content_length": "integer",
+                    "metadata.content_weight": "float"
                 }
 
                 # Проверяем наличие полнотекстового индекса
@@ -429,6 +430,26 @@ async def update_task_status(task_id: str, status: str, progress: int = 0,
     logger.info(f"Task {task_id}: {status} - {progress}% [{stage}] {message}")
 
 
+def calculate_content_weight(content_length: int) -> float:
+    """
+    Рассчитывает вес контента на основе его длины.
+
+    Args:
+        content_length: Длина контента в символах
+
+    Returns:
+        float: Вес от 0.1 до 1.0
+    """
+    if content_length < 10:
+        return 0.1  # Почти пустые
+    elif content_length < 50:
+        return 0.5  # Короткие
+    elif content_length < 200:
+        return 0.8  # Средние
+    else:
+        return 1.0  # Полноценные
+
+
 async def process_document_with_semantic_chunker(document_path: str, application_id: str,
                                                  additional_metadata: Optional[Dict[str, Any]] = None) -> List[Document]:
     """Асинхронно обрабатывает документ с использованием семантического чанкера"""
@@ -482,9 +503,10 @@ async def process_document_with_semantic_chunker(document_path: str, application
                     "content_type": chunk.get("type", "unknown"),
                     "chunk_index": i,
                     "section": chunk.get("heading", "Не определено"),
-                    # Добавляем метки
+                    # Добавляем метки и вес контента
                     "is_empty": content_length < 10,
-                    "content_length": content_length
+                    "content_length": content_length,
+                    "content_weight": calculate_content_weight(content_length)  # Новое поле
                 }
 
                 # ВАЖНО: Добавляем дополнительные метаданные (file_id, index_session_id и т.д.)
@@ -568,7 +590,8 @@ async def process_document_with_semantic_chunker(document_path: str, application
                         "chunk_index": i,
                         "section": chunk.get("heading", "Не определено"),
                         "is_empty": content_length < 10,
-                        "content_length": content_length
+                        "content_length": content_length,
+                        "content_weight": calculate_content_weight(content_length)
                     }
 
                     # Добавляем дополнительные метаданные
@@ -596,7 +619,7 @@ async def process_document_with_semantic_chunker(document_path: str, application
                         metadata["page_numbers"] = []
 
                     documents.append(Document(
-                        page_content=content,  # Используем оригинальный контент
+                        page_content=content,
                         metadata=metadata
                     ))
 
