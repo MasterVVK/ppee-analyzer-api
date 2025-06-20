@@ -192,8 +192,8 @@ class QdrantManager:
             query: str,
             filter_dict: Optional[Dict[str, Any]] = None,
             k: int = 3,
-            exclude_empty: bool = True,  # Оставляем параметр для совместимости API
-            apply_content_weight: bool = True  # Применять ли веса контента к score
+            exclude_empty: bool = True,
+            apply_content_weight: bool = True
     ) -> List[Document]:
         """
         Выполняет семантический поиск в векторном хранилище.
@@ -202,7 +202,7 @@ class QdrantManager:
             query: Текст запроса
             filter_dict: Словарь для фильтрации
             k: Количество результатов
-            exclude_empty: Исключать ли пустые чанки из результатов (для совместимости API)
+            exclude_empty: Исключать ли пустые чанки из результатов
             apply_content_weight: Применять ли веса контента к score
 
         Returns:
@@ -224,9 +224,6 @@ class QdrantManager:
                     )
                 )
 
-        # УБИРАЕМ фильтрацию по is_empty - она ломает старые документы
-        # Пустые чанки будут отфильтрованы через content_weight
-
         # Создаем объект фильтра только если есть условия
         filter_obj = None
         if conditions:
@@ -242,13 +239,26 @@ class QdrantManager:
             k=search_k
         )
 
-        # Преобразование результатов с применением весов
+        # Преобразование результатов с применением весов и фильтрацией
         documents = []
         for doc, score in search_results:
-            # Получаем вес контента (по умолчанию 1.0 для старых документов)
+            # ФИЛЬТРАЦИЯ ПУСТЫХ: Проверяем после получения результатов
+            if exclude_empty:
+                # Для новых документов проверяем метаданные
+                if doc.metadata.get('is_empty', False):
+                    continue  # Пропускаем документ
+
+                # Для старых документов без is_empty проверяем длину контента
+                if 'is_empty' not in doc.metadata:
+                    content_length = len(doc.page_content.strip())
+                    if content_length < 10:
+                        logger.debug(f"Пропускаем старый документ с длиной контента {content_length}")
+                        continue  # Пропускаем короткий документ
+
+            # Получаем вес контента
             content_weight = doc.metadata.get('content_weight', 1.0)
 
-            # ДОБАВЛЯЕМ: Эвристика для старых документов без content_weight
+            # Эвристика для старых документов без content_weight
             if 'content_weight' not in doc.metadata and apply_content_weight:
                 # Оцениваем вес по длине контента
                 content_length = len(doc.page_content.strip())
@@ -261,7 +271,6 @@ class QdrantManager:
                 else:
                     content_weight = 1.0
 
-                # Логируем для отладки
                 logger.debug(f"Вычислен content_weight={content_weight} для документа без метаданных "
                             f"(длина контента: {content_length})")
 
@@ -277,19 +286,24 @@ class QdrantManager:
             documents.append(doc)
 
         # Если применяли веса, нужно пересортировать и взять только k результатов
-        if apply_content_weight and len(documents) > k:
+        if apply_content_weight:
             # Сортируем по убыванию score
             documents.sort(key=lambda x: x.metadata['score'], reverse=True)
+            # Берем только k результатов
+            documents = documents[:k]
+        else:
+            # Если веса не применялись, просто ограничиваем количество
             documents = documents[:k]
 
         # Логируем информацию о применении весов
-        if apply_content_weight:
-            weight_stats = {
+        if apply_content_weight or exclude_empty:
+            stats = {
                 'total_found': len(search_results),
+                'after_empty_filter': len(documents) if not apply_content_weight else 'N/A',
                 'returned': len(documents),
-                'weights_applied': [doc.metadata.get('weight_applied', 1.0) for doc in documents[:5]]  # Первые 5 для примера
+                'weights_applied': apply_content_weight
             }
-            logger.debug(f"Применены веса контента: {weight_stats}")
+            logger.debug(f"Статистика поиска: {stats}")
 
         return documents
 
