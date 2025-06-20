@@ -192,8 +192,8 @@ class QdrantManager:
             query: str,
             filter_dict: Optional[Dict[str, Any]] = None,
             k: int = 3,
-            exclude_empty: bool = True,
-            apply_content_weight: bool = True  # Новый параметр
+            exclude_empty: bool = True,  # Оставляем параметр для совместимости API
+            apply_content_weight: bool = True  # Применять ли веса контента к score
     ) -> List[Document]:
         """
         Выполняет семантический поиск в векторном хранилище.
@@ -202,7 +202,7 @@ class QdrantManager:
             query: Текст запроса
             filter_dict: Словарь для фильтрации
             k: Количество результатов
-            exclude_empty: Исключать ли пустые чанки из результатов
+            exclude_empty: Исключать ли пустые чанки из результатов (для совместимости API)
             apply_content_weight: Применять ли веса контента к score
 
         Returns:
@@ -224,14 +224,8 @@ class QdrantManager:
                     )
                 )
 
-        # Добавляем фильтр для исключения пустых чанков
-        if exclude_empty:
-            conditions.append(
-                models.FieldCondition(
-                    key="metadata.is_empty",
-                    match=models.MatchValue(value=False)
-                )
-            )
+        # УБИРАЕМ фильтрацию по is_empty - она ломает старые документы
+        # Пустые чанки будут отфильтрованы через content_weight
 
         # Создаем объект фильтра только если есть условия
         filter_obj = None
@@ -253,6 +247,23 @@ class QdrantManager:
         for doc, score in search_results:
             # Получаем вес контента (по умолчанию 1.0 для старых документов)
             content_weight = doc.metadata.get('content_weight', 1.0)
+
+            # ДОБАВЛЯЕМ: Эвристика для старых документов без content_weight
+            if 'content_weight' not in doc.metadata and apply_content_weight:
+                # Оцениваем вес по длине контента
+                content_length = len(doc.page_content.strip())
+                if content_length < 10:
+                    content_weight = 0.1
+                elif content_length < 50:
+                    content_weight = 0.5
+                elif content_length < 200:
+                    content_weight = 0.8
+                else:
+                    content_weight = 1.0
+
+                # Логируем для отладки
+                logger.debug(f"Вычислен content_weight={content_weight} для документа без метаданных "
+                            f"(длина контента: {content_length})")
 
             # Применяем вес к score
             if apply_content_weight:
