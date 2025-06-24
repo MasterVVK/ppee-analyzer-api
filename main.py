@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
@@ -20,7 +20,6 @@ import GPUtil
 # Импорты из ppee_analyzer
 from ppee_analyzer.vector_store import QdrantManager, BGEReranker, OllamaEmbeddings
 from ppee_analyzer.semantic_chunker import SemanticChunker
-#from ppee_analyzer.checklist import ChecklistAnalyzer
 from langchain_core.documents import Document
 
 # Импорты из локальных адаптеров
@@ -41,6 +40,12 @@ active_indexing_tasks = 0  # Счетчик активных задач инде
 indexing_lock = None  # Блокировка для счетчика
 indexing_queue = None  # Очередь для задач индексации
 indexing_semaphore = None  # Семафор для ограничения одной индексации
+
+# Переменные для контроля нагрузки на эндпоинты
+search_semaphore = asyncio.Semaphore(3)  # До 3 параллельных поисков
+llm_semaphore = asyncio.Semaphore(1)  # Только 1 запрос к LLM одновременно
+search_queue = asyncio.Queue()  # Очередь для поисковых запросов
+llm_queue = asyncio.Queue()  # Очередь для LLM запросов
 
 # Настройки очистки памяти
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10s")  # Время хранения модели Ollama в памяти
@@ -227,8 +232,6 @@ async def lifespan(app: FastAPI):
 
     except Exception as e:
         logger.error(f"Критическая ошибка при создании коллекции: {e}")
-        # Решаем, что делать при ошибке - продолжать или останавливать сервис
-        # raise  # Раскомментировать, если хотим остановить сервис при ошибке
 
     # НЕ инициализируем ререйтер при старте
     logger.info("Сервис запущен. Модели будут загружены при первом использовании.")
@@ -239,6 +242,10 @@ async def lifespan(app: FastAPI):
     # Запускаем обработчик очереди индексации
     indexing_worker_task = asyncio.create_task(indexing_queue_worker())
 
+    # Запускаем обработчики очередей для эндпоинтов
+    search_worker_task = asyncio.create_task(search_queue_worker())
+    llm_worker_task = asyncio.create_task(llm_queue_worker())
+
     yield
 
     # Shutdown
@@ -247,6 +254,8 @@ async def lifespan(app: FastAPI):
     # Отменяем фоновые задачи
     cleanup_task.cancel()
     indexing_worker_task.cancel()
+    search_worker_task.cancel()
+    llm_worker_task.cancel()
 
     try:
         await cleanup_task
@@ -258,10 +267,28 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    try:
+        await search_worker_task
+    except asyncio.CancelledError:
+        pass
+
+    try:
+        await llm_worker_task
+    except asyncio.CancelledError:
+        pass
+
     # Ожидаем завершения всех задач в очереди
     if indexing_queue.qsize() > 0:
         logger.info(f"Ожидание завершения {indexing_queue.qsize()} задач в очереди...")
         await indexing_queue.join()
+
+    if search_queue.qsize() > 0:
+        logger.info(f"Ожидание завершения {search_queue.qsize()} поисковых запросов...")
+        await search_queue.join()
+
+    if llm_queue.qsize() > 0:
+        logger.info(f"Ожидание завершения {llm_queue.qsize()} LLM запросов...")
+        await llm_queue.join()
 
     # Завершаем executor
     executor.shutdown(wait=True)
@@ -314,13 +341,6 @@ class SearchRequest(BaseModel):
     hybrid_threshold: int = 10
 
 
-class AnalyzeApplicationRequest(BaseModel):
-    task_id: str
-    application_id: str
-    checklist_items: List[Dict[str, Any]]
-    llm_params: Dict[str, Any]
-
-
 class ProcessQueryRequest(BaseModel):
     model_name: str
     prompt: str
@@ -356,7 +376,30 @@ async def periodic_cleanup():
             logger.info("Выполнена периодическая очистка GPU кэшей")
 
 
-async def indexing_queue_worker():
+async def analysis_queue_worker():
+    """Воркер для обработки очереди анализа - обрабатывает только один анализ за раз"""
+    logger.info("Запущен обработчик очереди анализа")
+
+    while True:
+        try:
+            # Ждем задачу из очереди
+            request = await analysis_queue.get()
+
+            # Обрабатываем задачу с семафором (только одна за раз)
+            async with analysis_semaphore:
+                logger.info(f"Начало анализа: {request.task_id}")
+                await analyze_application_task_worker(request)
+                logger.info(f"Завершен анализ: {request.task_id}")
+
+            # Помечаем задачу как выполненную
+            analysis_queue.task_done()
+
+        except asyncio.CancelledError:
+            logger.info("Остановка обработчика очереди анализа")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в обработчике очереди анализа: {e}")
+            await asyncio.sleep(1)  # Небольшая пауза при ошибке
     """Воркер для обработки очереди индексации - обрабатывает только одну задачу за раз"""
     logger.info("Запущен обработчик очереди индексации")
 
@@ -657,7 +700,11 @@ async def get_system_status():
             "embeddings_loaded": False,
             "reranker_loaded": reranker is not None,
             "memory_info": {},
-            "indexing_queue_size": indexing_queue.qsize() if indexing_queue else 0
+            "queues": {
+                "indexing": indexing_queue.qsize() if indexing_queue else 0,
+                "search": search_queue.qsize(),
+                "llm": llm_queue.qsize()
+            }
         }
 
         # Проверяем загружены ли эмбеддинги
@@ -681,9 +728,39 @@ async def get_system_status():
 
 @app.get("/queue/status")
 async def get_queue_status():
-    """Получает статус очереди индексации"""
+    """Получает статус всех очередей"""
     try:
-        queue_size = indexing_queue.qsize() if indexing_queue else 0
+        return {
+            "status": "success",
+            "queues": {
+                "indexing": {
+                    "size": indexing_queue.qsize() if indexing_queue else 0,
+                    "active_tasks": active_indexing_tasks,
+                    "semaphore_available": indexing_semaphore._value if indexing_semaphore else 0
+                },
+                "search": {
+                    "size": search_queue.qsize(),
+                    "semaphore_available": search_semaphore._value,
+                    "max_concurrent": 3
+                },
+                "llm": {
+                    "size": llm_queue.qsize(),
+                    "semaphore_available": llm_semaphore._value,
+                    "max_concurrent": 1
+                }
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении статуса очередей: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/queue/analysis/status")
+async def get_analysis_queue_status():
+    """Получает статус очереди анализа"""
+    try:
+        queue_size = analysis_queue.qsize() if analysis_queue else 0
 
         # Получаем список задач в очереди
         queue_tasks = []
@@ -692,37 +769,31 @@ async def get_queue_status():
             temp_list = []
             for _ in range(queue_size):
                 try:
-                    item = indexing_queue.get_nowait()
+                    item = analysis_queue.get_nowait()
                     temp_list.append(item)
                     queue_tasks.append({
                         "task_id": item.task_id,
-                        "application_id": item.application_id,
-                        "document_path": os.path.basename(item.document_path)
+                        "application_id": item.application_id
                     })
                 except asyncio.QueueEmpty:
                     break
 
             # Возвращаем элементы обратно в очередь
             for item in temp_list:
-                await indexing_queue.put(item)
+                await analysis_queue.put(item)
 
         return {
             "status": "success",
             "queue": {
                 "size": queue_size,
-                "active_task": active_indexing_tasks > 0,
+                "active_task": active_analysis_tasks > 0,
                 "tasks": queue_tasks
             }
         }
 
     except Exception as e:
-        logger.error(f"Ошибка при получении статуса очереди: {e}")
+        logger.error(f"Ошибка при получении статуса очереди анализа: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
 
 
 @app.get("/task/{task_id}/status")
@@ -890,7 +961,39 @@ async def index_document_task(request: IndexDocumentRequest):
 
 @app.post("/search")
 async def search(request: SearchRequest):
-    """Асинхронно выполняет семантический поиск"""
+    """Асинхронно выполняет семантический поиск с контролем нагрузки"""
+    # Создаем уникальный ID для задачи
+    task_id = str(uuid.uuid4())
+
+    # Создаем Future для результата
+    future = asyncio.Future()
+
+    # Добавляем задачу в очередь
+    await search_queue.put({
+        'task_id': task_id,
+        'request': request,
+        'future': future
+    })
+
+    # Логируем размер очереди
+    queue_size = search_queue.qsize()
+    if queue_size > 0:
+        logger.info(f"Поисковый запрос добавлен в очередь. Позиция: {queue_size}")
+
+    try:
+        # Ждем результат
+        result = await future
+        return result
+    except Exception as e:
+        logger.exception(f"Ошибка поиска: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _process_search_request(task_data: dict):
+    """Внутренняя функция для обработки поискового запроса"""
+    request = task_data['request']
+    future = task_data['future']
+
     try:
         loop = asyncio.get_event_loop()
 
@@ -932,11 +1035,12 @@ async def search(request: SearchRequest):
                 request.rerank_limit
             )
 
-        return {"status": "success", "results": results}
+        # Устанавливаем результат
+        future.set_result({"status": "success", "results": results})
 
     except Exception as e:
-        logger.exception(f"Ошибка поиска: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Устанавливаем исключение
+        future.set_exception(e)
 
 
 def vector_search(application_id: str, query: str, limit: int,
@@ -1105,13 +1209,30 @@ def get_document_key(doc: Dict) -> str:
 
 @app.post("/analyze")
 async def analyze_application(request: AnalyzeApplicationRequest):
-    """Запускает асинхронный анализ заявки"""
-    asyncio.create_task(analyze_application_task(request))
-    return {"status": "started", "task_id": request.task_id}
+    """Добавляет задачу анализа в очередь"""
+    # Добавляем задачу в очередь
+    await analysis_queue.put(request)
+
+    # Обновляем статус задачи
+    queue_position = analysis_queue.qsize()
+    await update_task_status(request.task_id, "QUEUED", 0, "queue",
+                           f"Задача добавлена в очередь анализа. Позиция: {queue_position}")
+
+    return {
+        "status": "queued",
+        "task_id": request.task_id,
+        "queue_position": queue_position
+    }
 
 
-async def analyze_application_task(request: AnalyzeApplicationRequest):
-    """Асинхронная задача анализа с умным поиском"""
+async def analyze_application_task_worker(request: AnalyzeApplicationRequest):
+    """Воркер для выполнения анализа - вызывается из очереди"""
+    global active_analysis_tasks
+
+    # Увеличиваем счетчик активных задач
+    async with analysis_lock:
+        active_analysis_tasks += 1
+        logger.info(f"Начат анализ. Активных анализов: {active_analysis_tasks}")
     try:
         await update_task_status(request.task_id, "PROGRESS", 10, "prepare", "Инициализация анализа...")
 
@@ -1136,26 +1257,39 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                 query = item['search_query']
                 search_method = "vector"
 
-                if use_smart_search:
-                    if len(query) < hybrid_threshold:
-                        logger.info(f"Используем гибридный поиск для '{query}' (<{hybrid_threshold} символов)")
-                        search_method = "hybrid"
+                # Выполняем поиск С СЕМАФОРОМ
+                async with analysis_search_semaphore:
+                    if use_smart_search:
+                        if len(query) < hybrid_threshold:
+                            logger.info(f"Используем гибридный поиск для '{query}' (<{hybrid_threshold} символов)")
+                            search_method = "hybrid"
 
-                        # Выполняем гибридный поиск
-                        search_results = await loop.run_in_executor(
-                            executor,
-                            hybrid_search,
-                            request.application_id,
-                            query,
-                            item.get('search_limit', 3),
-                            0.5,  # vector_weight
-                            0.5,  # text_weight
-                            item.get('use_reranker', False)
-                        )
+                            # Выполняем гибридный поиск
+                            search_results = await loop.run_in_executor(
+                                executor,
+                                hybrid_search,
+                                request.application_id,
+                                query,
+                                item.get('search_limit', 3),
+                                0.5,  # vector_weight
+                                0.5,  # text_weight
+                                item.get('use_reranker', False)
+                            )
+                        else:
+                            logger.info(f"Используем векторный поиск для '{query}' (>={hybrid_threshold} символов)")
+
+                            # Выполняем векторный поиск
+                            search_results = await loop.run_in_executor(
+                                executor,
+                                vector_search,
+                                request.application_id,
+                                query,
+                                item.get('search_limit', 3),
+                                item.get('use_reranker', False),
+                                item.get('rerank_limit', 10) if item.get('use_reranker', False) else None
+                            )
                     else:
-                        logger.info(f"Используем векторный поиск для '{query}' (>={hybrid_threshold} символов)")
-
-                        # Выполняем векторный поиск
+                        # Обычный векторный поиск
                         search_results = await loop.run_in_executor(
                             executor,
                             vector_search,
@@ -1165,17 +1299,6 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                             item.get('use_reranker', False),
                             item.get('rerank_limit', 10) if item.get('use_reranker', False) else None
                         )
-                else:
-                    # Обычный векторный поиск
-                    search_results = await loop.run_in_executor(
-                        executor,
-                        vector_search,
-                        request.application_id,
-                        query,
-                        item.get('search_limit', 3),
-                        item.get('use_reranker', False),
-                        item.get('rerank_limit', 10) if item.get('use_reranker', False) else None
-                    )
 
                 # Преобразуем результаты в формат Document для LLM
                 search_documents = []
@@ -1186,7 +1309,7 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                     )
                     search_documents.append(doc)
 
-                # Обработка через LLM
+                # Обработка через LLM С СЕМАФОРОМ
                 if search_documents:
                     # Форматируем контекст
                     context = "\n\n".join([doc.page_content for doc in search_documents])
@@ -1199,17 +1322,18 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
                     )
 
                     # Вызываем LLM асинхронно с полным промптом
-                    llm_response = await process_llm_query_async(
-                        item['llm_model'],
-                        full_prompt,  # Передаем полный промпт
-                        "",  # Контекст уже включен в промпт
-                        {
-                            'temperature': item.get('llm_temperature', 0.1),
-                            'max_tokens': item.get('llm_max_tokens', 1000),
-                            'context_length': item.get('context_length', 8192)
-                        },
-                        query
-                    )
+                    async with analysis_llm_semaphore:
+                        llm_response = await process_llm_query_async(
+                            item['llm_model'],
+                            full_prompt,  # Передаем полный промпт
+                            "",  # Контекст уже включен в промпт
+                            {
+                                'temperature': item.get('llm_temperature', 0.1),
+                                'max_tokens': item.get('llm_max_tokens', 1000),
+                                'context_length': item.get('context_length', 8192)
+                            },
+                            query
+                        )
 
                     # Извлекаем значение
                     value = extract_value_from_response(llm_response, query)
@@ -1306,6 +1430,14 @@ async def analyze_application_task(request: AnalyzeApplicationRequest):
         logger.exception(f"Ошибка анализа: {e}")
         cleanup_gpu_memory()  # Освобождаем кэши при ошибке
         await update_task_status(request.task_id, "FAILURE", 0, "error", str(e))
+    finally:
+        # Уменьшаем счетчик активных задач
+        async with analysis_lock:
+            active_analysis_tasks -= 1
+            logger.info(f"Анализ завершен. Активных анализов: {active_analysis_tasks}")
+
+        # Очистка GPU
+        cleanup_gpu_memory()
 
 
 # Вспомогательные функции для анализа
@@ -1400,6 +1532,64 @@ async def get_llm_models():
     except Exception as e:
         logger.exception(f"Ошибка получения моделей: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/llm/process")
+async def process_llm_query(request: ProcessQueryRequest):
+    """Асинхронно обрабатывает запрос через LLM с контролем нагрузки"""
+    # Создаем уникальный ID для задачи
+    task_id = str(uuid.uuid4())
+
+    # Создаем Future для результата
+    future = asyncio.Future()
+
+    # Добавляем задачу в очередь
+    await llm_queue.put({
+        'task_id': task_id,
+        'request': request,
+        'future': future
+    })
+
+    # Логируем размер очереди
+    queue_size = llm_queue.qsize()
+    if queue_size > 0:
+        logger.info(f"LLM запрос добавлен в очередь. Позиция: {queue_size}")
+
+    try:
+        # Ждем результат
+        result = await future
+        return result
+    except Exception as e:
+        logger.exception(f"Ошибка LLM: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _process_llm_request(task_data: dict):
+    """Внутренняя функция для обработки LLM запроса"""
+    request = task_data['request']
+    future = task_data['future']
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _process():
+            llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
+            return llm_provider.process_query(
+                model_name=request.model_name,
+                prompt=request.prompt,
+                context=request.context,
+                parameters=request.parameters,
+                query=request.query
+            )
+
+        response = await loop.run_in_executor(executor, _process)
+
+        # Устанавливаем результат
+        future.set_result({"status": "success", "response": response})
+
+    except Exception as e:
+        # Устанавливаем исключение
+        future.set_exception(e)
 
 
 @app.get("/applications/{application_id}/stats")
@@ -1718,7 +1908,6 @@ async def delete_document_chunks(application_id: str, document_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
 @app.get("/api/v1/system/stats")
 async def get_system_stats():
     """Получение статистики использования системных ресурсов"""
@@ -1844,7 +2033,11 @@ async def get_system_stats():
                 "process_count": process_count,
                 "disk_percent": disk_percent,
                 "active_indexing_tasks": active_indexing_tasks,
-                "indexing_queue_size": indexing_queue.qsize() if indexing_queue else 0
+                "queues": {
+                    "indexing": indexing_queue.qsize() if indexing_queue else 0,
+                    "search": search_queue.qsize(),
+                    "llm": llm_queue.qsize()
+                }
             }
         }
 
@@ -1860,8 +2053,10 @@ async def get_system_stats():
             "gpu": {"name": "Ошибка", "vram_percent": 0, "vram_used_gb": 0,
                     "vram_total_gb": 0, "temperature": None, "utilization": 0},
             "system": {"process_count": 0, "disk_percent": 0,
-                      "active_indexing_tasks": 0, "indexing_queue_size": 0}
+                      "active_indexing_tasks": 0,
+                      "indexing_queue_size": 0}
         }
+
 
 @app.delete("/applications/{application_id}/files/{file_id}/chunks")
 async def delete_file_chunks(application_id: str, file_id: str):
@@ -2041,6 +2236,7 @@ async def get_application_files(application_id: str):
     except Exception as e:
         logger.exception(f"Ошибка получения списка файлов: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
