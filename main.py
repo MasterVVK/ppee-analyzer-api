@@ -16,7 +16,6 @@ import time
 import psutil
 import GPUtil
 
-
 # Импорты из ppee_analyzer
 from ppee_analyzer.vector_store import QdrantManager, BGEReranker, OllamaEmbeddings
 from ppee_analyzer.semantic_chunker import SemanticChunker
@@ -42,283 +41,22 @@ indexing_queue = None  # Очередь для задач индексации
 indexing_semaphore = None  # Семафор для ограничения одной индексации
 
 # Переменные для контроля нагрузки на эндпоинты
-search_semaphore = asyncio.Semaphore(3)  # До 3 параллельных поисков
+search_semaphore = asyncio.Semaphore(1)  # До 3 параллельных поисков
 llm_semaphore = asyncio.Semaphore(1)  # Только 1 запрос к LLM одновременно
 search_queue = asyncio.Queue()  # Очередь для поисковых запросов
 llm_queue = asyncio.Queue()  # Очередь для LLM запросов
 
+# Переменные для анализа
+analysis_queue = None
+analysis_semaphore = None
+active_analysis_tasks = 0
+analysis_lock = None
+analysis_search_semaphore = None
+analysis_llm_semaphore = None
+
 # Настройки очистки памяти
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10s")  # Время хранения модели Ollama в памяти
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    global redis_client, qdrant_manager, reranker_semaphore, indexing_lock, indexing_queue, indexing_semaphore
-
-    # Инициализация семафора для ререйтера
-    reranker_semaphore = asyncio.Semaphore(1)
-
-    # Инициализация блокировки для счетчика индексаций
-    indexing_lock = asyncio.Lock()
-
-    # Инициализация очереди для задач индексации
-    indexing_queue = asyncio.Queue()
-
-    # Семафор для ограничения одной индексации за раз
-    indexing_semaphore = asyncio.Semaphore(1)
-
-    # Инициализация Redis с асинхронным клиентом
-    redis_client = await redis.from_url("redis://localhost:6379", decode_responses=True)
-    logger.info("Redis клиент инициализирован")
-
-    # Инициализация QdrantManager БЕЗ загрузки моделей
-    loop = asyncio.get_event_loop()
-    qdrant_manager = await loop.run_in_executor(
-        executor,
-        lambda: QdrantManager(
-            collection_name="ppee_applications",
-            host="localhost",
-            port=6333,
-            embeddings_type="ollama",
-            model_name="bge-m3",
-            ollama_url="http://localhost:11434",
-            check_availability=False,  # ВАЖНО: Отключаем проверку при старте
-            ollama_keep_alive=OLLAMA_KEEP_ALIVE  # Время хранения модели в памяти из переменной окружения
-        )
-    )
-    logger.info("QdrantManager инициализирован")
-
-    # СОЗДАНИЕ КОЛЛЕКЦИИ
-    logger.info("Проверка и создание коллекции Qdrant...")
-    try:
-        # Получаем список существующих коллекций
-        collections_response = await loop.run_in_executor(
-            executor,
-            lambda: qdrant_manager.client.get_collections()
-        )
-
-        existing_collections = [c.name for c in collections_response.collections]
-        logger.info(f"Существующие коллекции: {existing_collections}")
-
-        # Проверяем, существует ли наша коллекция
-        if qdrant_manager.collection_name not in existing_collections:
-            logger.info(f"Коллекция '{qdrant_manager.collection_name}' не найдена. Создаем...")
-
-            # Создаем коллекцию
-            from qdrant_client.http import models
-            await loop.run_in_executor(
-                executor,
-                lambda: qdrant_manager.client.create_collection(
-                    collection_name=qdrant_manager.collection_name,
-                    vectors_config=models.VectorParams(
-                        size=qdrant_manager.vector_size,
-                        distance=models.Distance.COSINE
-                    )
-                )
-            )
-            logger.info(f"Коллекция '{qdrant_manager.collection_name}' создана")
-
-            # Создаем индексы для оптимизации поиска
-            logger.info("Создание индексов...")
-
-            # Индекс для application_id
-            await loop.run_in_executor(
-                executor,
-                lambda: qdrant_manager.client.create_payload_index(
-                    collection_name=qdrant_manager.collection_name,
-                    field_name="metadata.application_id",
-                    field_schema="keyword"
-                )
-            )
-
-            # Индекс для content_type
-            await loop.run_in_executor(
-                executor,
-                lambda: qdrant_manager.client.create_payload_index(
-                    collection_name=qdrant_manager.collection_name,
-                    field_name="metadata.content_type",
-                    field_schema="keyword"
-                )
-            )
-
-            # Полнотекстовый индекс для page_content
-            await loop.run_in_executor(
-                executor,
-                lambda: qdrant_manager.client.create_payload_index(
-                    collection_name=qdrant_manager.collection_name,
-                    field_name="page_content",
-                    field_schema="text"
-                )
-            )
-
-            # НОВЫЕ ИНДЕКСЫ ДЛЯ ФИЛЬТРАЦИИ ПУСТЫХ ЧАНКОВ
-            # Индекс для фильтрации пустых чанков
-            await loop.run_in_executor(
-                executor,
-                lambda: qdrant_manager.client.create_payload_index(
-                    collection_name=qdrant_manager.collection_name,
-                    field_name="metadata.is_empty",
-                    field_schema="bool"
-                )
-            )
-            logger.info("Индекс для metadata.is_empty создан")
-
-            # Индекс для фильтрации по длине контента
-            await loop.run_in_executor(
-                executor,
-                lambda: qdrant_manager.client.create_payload_index(
-                    collection_name=qdrant_manager.collection_name,
-                    field_name="metadata.content_length",
-                    field_schema="integer"
-                )
-            )
-            logger.info("Индекс для metadata.content_length создан")
-
-            logger.info("Все индексы созданы успешно")
-
-        else:
-            logger.info(f"Коллекция '{qdrant_manager.collection_name}' уже существует")
-
-            # Проверяем и создаем недостающие индексы
-            try:
-                collection_info = await loop.run_in_executor(
-                    executor,
-                    lambda: qdrant_manager.client.get_collection(qdrant_manager.collection_name)
-                )
-
-                # Список необходимых индексов
-                required_indices = {
-                    "metadata.application_id": "keyword",
-                    "metadata.content_type": "keyword",
-                    "page_content": "text",
-                    "metadata.is_empty": "bool",
-                    "metadata.content_length": "integer",
-                    "metadata.content_weight": "float"
-                }
-
-                # Проверяем наличие полнотекстового индекса
-                if hasattr(collection_info, 'payload_schema'):
-                    existing_indices = set(collection_info.payload_schema.keys()) if collection_info.payload_schema else set()
-
-                    # Создаем недостающие индексы
-                    for field_name, field_schema in required_indices.items():
-                        if field_name not in existing_indices:
-                            logger.info(f"Создание недостающего индекса для {field_name}...")
-                            try:
-                                await loop.run_in_executor(
-                                    executor,
-                                    lambda fn=field_name, fs=field_schema: qdrant_manager.client.create_payload_index(
-                                        collection_name=qdrant_manager.collection_name,
-                                        field_name=fn,
-                                        field_schema=fs
-                                    )
-                                )
-                                logger.info(f"Индекс для {field_name} создан")
-                            except Exception as idx_error:
-                                logger.warning(f"Не удалось создать индекс для {field_name}: {idx_error}")
-
-            except Exception as e:
-                logger.warning(f"Не удалось проверить индексы: {e}")
-
-        # Получаем информацию о коллекции
-        collection_info = await loop.run_in_executor(
-            executor,
-            lambda: qdrant_manager.client.get_collection(qdrant_manager.collection_name)
-        )
-
-        logger.info(f"Коллекция готова к работе. Статус: {collection_info.status}, "
-                    f"Векторов: {collection_info.vectors_count}")
-
-    except Exception as e:
-        logger.error(f"Критическая ошибка при создании коллекции: {e}")
-
-    # НЕ инициализируем ререйтер при старте
-    logger.info("Сервис запущен. Модели будут загружены при первом использовании.")
-
-    # Запускаем периодическую очистку памяти
-    cleanup_task = asyncio.create_task(periodic_cleanup())
-
-    # Запускаем обработчик очереди индексации
-    indexing_worker_task = asyncio.create_task(indexing_queue_worker())
-
-    # Запускаем обработчики очередей для эндпоинтов
-    search_worker_task = asyncio.create_task(search_queue_worker())
-    llm_worker_task = asyncio.create_task(llm_queue_worker())
-
-    yield
-
-    # Shutdown
-    logger.info("Начало остановки сервиса...")
-
-    # Отменяем фоновые задачи
-    cleanup_task.cancel()
-    indexing_worker_task.cancel()
-    search_worker_task.cancel()
-    llm_worker_task.cancel()
-
-    try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
-
-    try:
-        await indexing_worker_task
-    except asyncio.CancelledError:
-        pass
-
-    try:
-        await search_worker_task
-    except asyncio.CancelledError:
-        pass
-
-    try:
-        await llm_worker_task
-    except asyncio.CancelledError:
-        pass
-
-    # Ожидаем завершения всех задач в очереди
-    if indexing_queue.qsize() > 0:
-        logger.info(f"Ожидание завершения {indexing_queue.qsize()} задач в очереди...")
-        await indexing_queue.join()
-
-    if search_queue.qsize() > 0:
-        logger.info(f"Ожидание завершения {search_queue.qsize()} поисковых запросов...")
-        await search_queue.join()
-
-    if llm_queue.qsize() > 0:
-        logger.info(f"Ожидание завершения {llm_queue.qsize()} LLM запросов...")
-        await llm_queue.join()
-
-    # Завершаем executor
-    executor.shutdown(wait=True)
-
-    # Очищаем ресурсы ререйтера если он был инициализирован
-    if reranker:
-        await loop.run_in_executor(executor, reranker.cleanup)
-        cleanup_gpu_memory()
-
-    # Очищаем ресурсы QdrantManager
-    if qdrant_manager:
-        await loop.run_in_executor(executor, qdrant_manager.cleanup)
-
-    # Закрываем Redis соединение
-    await redis_client.close()
-
-    logger.info("Сервис остановлен")
-
-
-app = FastAPI(lifespan=lifespan)
-
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Разрешаем все источники для тестирования
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Pydantic модели
 class IndexDocumentRequest(BaseModel):
@@ -328,6 +66,7 @@ class IndexDocumentRequest(BaseModel):
     document_id: Optional[str] = None  # Добавляем для совместимости
     delete_existing: bool = False
     metadata: Optional[Dict[str, Any]] = None  # Добавляем для передачи file_id
+
 
 class SearchRequest(BaseModel):
     application_id: str
@@ -349,6 +88,27 @@ class ProcessQueryRequest(BaseModel):
     query: Optional[str] = None
 
 
+class ChecklistItem(BaseModel):
+    id: str
+    name: str
+    search_query: str
+    search_limit: int = 3
+    use_reranker: bool = False
+    rerank_limit: Optional[int] = None
+    llm_prompt_template: str
+    llm_model: str
+    llm_temperature: float = 0.1
+    llm_max_tokens: int = 1000
+    context_length: int = 8192
+
+
+class AnalyzeApplicationRequest(BaseModel):
+    task_id: str
+    application_id: str
+    checklist_items: List[ChecklistItem]
+    llm_params: Dict[str, Any] = {}
+
+
 # Функции для управления памятью
 def cleanup_gpu_memory():
     """Освобождает память GPU - только кэши, не выгружает модели"""
@@ -365,6 +125,230 @@ def cleanup_gpu_memory():
         logger.warning(f"Ошибка при очистке GPU памяти: {e}")
 
 
+def calculate_content_weight(content_length: int) -> float:
+    """
+    Рассчитывает вес контента на основе его длины.
+
+    Args:
+        content_length: Длина контента в символах
+
+    Returns:
+        float: Вес от 0.1 до 1.0
+    """
+    if content_length < 10:
+        return 0.1  # Почти пустые
+    elif content_length < 50:
+        return 0.5  # Короткие
+    elif content_length < 200:
+        return 0.8  # Средние
+    else:
+        return 1.0  # Полноценные
+
+
+# Вспомогательные функции для поиска
+def vector_search(application_id: str, query: str, limit: int,
+                  use_reranker: bool, rerank_limit: Optional[int]) -> List[Dict]:
+    """Векторный поиск с освобождением ресурсов"""
+    try:
+        # Получаем больше результатов для ререйтинга
+        search_limit = rerank_limit if rerank_limit else (limit * 3 if use_reranker else limit)
+
+        # Поиск
+        docs = qdrant_manager.search(
+            query=query,
+            filter_dict={"application_id": application_id},
+            k=search_limit
+        )
+
+        # Преобразуем результаты
+        results = []
+        for doc in docs:
+            results.append({
+                "text": doc.page_content,
+                "metadata": doc.metadata,
+                "score": doc.metadata.get('score', 0.0),
+                "search_type": "vector"
+            })
+
+        # Ререйтинг (не загружаем модель, если не нужен)
+        if use_reranker and results:
+            # Получаем ререйтер через asyncio
+            loop = asyncio.new_event_loop()
+            current_reranker = loop.run_until_complete(get_reranker())
+            loop.close()
+
+            if current_reranker:
+                try:
+                    results = current_reranker.rerank(query, results, top_k=limit, text_key="text")
+                finally:
+                    # Ререйтер сам освобождает память в своем finally блоке
+                    pass
+
+        return results[:limit]
+    except Exception as e:
+        raise
+
+
+def hybrid_search(application_id: str, query: str, limit: int,
+                  vector_weight: float, text_weight: float, use_reranker: bool) -> List[Dict]:
+    """Гибридный поиск с освобождением ресурсов"""
+    try:
+        # Векторный поиск (без ререйтинга на этом этапе)
+        vector_results = vector_search(application_id, query, limit * 2, False, None)
+
+        # Текстовый поиск через Qdrant
+        from qdrant_client.http import models
+
+        text_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="metadata.application_id",
+                    match=models.MatchValue(value=application_id)
+                ),
+                models.FieldCondition(
+                    key="page_content",
+                    match=models.MatchText(text=query)
+                )
+            ]
+        )
+
+        text_results_raw = qdrant_manager.client.scroll(
+            collection_name=qdrant_manager.collection_name,
+            scroll_filter=text_filter,
+            limit=limit * 2,
+            with_payload=True,
+            with_vectors=False
+        )[0]
+
+        # Преобразуем текстовые результаты
+        text_results = []
+        for i, point in enumerate(text_results_raw):
+            if hasattr(point, 'payload'):
+                text_results.append({
+                    "text": point.payload.get("page_content", ""),
+                    "metadata": point.payload.get("metadata", {}),
+                    "score": 1.0 - (i * 0.05),
+                    "search_type": "text"
+                })
+
+        # Объединяем результаты
+        combined = combine_results(vector_results, text_results, vector_weight, text_weight, limit)
+
+        # Ререйтинг
+        if use_reranker and combined:
+            # Получаем ререйтер через asyncio
+            loop = asyncio.new_event_loop()
+            current_reranker = loop.run_until_complete(get_reranker())
+            loop.close()
+
+            if current_reranker:
+                try:
+                    combined = current_reranker.rerank(query, combined, top_k=limit, text_key="text")
+                finally:
+                    # Ререйтер сам освобождает память в своем finally блоке
+                    pass
+
+        return combined[:limit]
+    except Exception as e:
+        raise
+
+
+def combine_results(vector_results: List[Dict], text_results: List[Dict],
+                    vector_weight: float, text_weight: float, limit: int) -> List[Dict]:
+    """Объединяет результаты векторного и текстового поиска"""
+    # Нормализуем веса
+    total_weight = vector_weight + text_weight
+    vector_weight = vector_weight / total_weight
+    text_weight = text_weight / total_weight
+
+    # Объединяем
+    results_dict = {}
+
+    for doc in vector_results:
+        key = get_document_key(doc)
+        results_dict[key] = {
+            "doc": doc,
+            "score": doc.get("score", 0.0) * vector_weight,
+            "search_type": "hybrid"
+        }
+
+    for doc in text_results:
+        key = get_document_key(doc)
+        if key in results_dict:
+            results_dict[key]["score"] += doc.get("score", 0.0) * text_weight
+        else:
+            results_dict[key] = {
+                "doc": doc,
+                "score": doc.get("score", 0.0) * text_weight,
+                "search_type": "hybrid"
+            }
+
+    # Сортируем
+    sorted_results = sorted(results_dict.values(), key=lambda x: x["score"], reverse=True)
+
+    # Преобразуем обратно
+    combined = []
+    for item in sorted_results[:limit]:
+        doc = item["doc"].copy()
+        doc["score"] = item["score"]
+        doc["search_type"] = "hybrid"
+        combined.append(doc)
+
+    return combined
+
+
+def get_document_key(doc: Dict) -> str:
+    """Создает уникальный ключ для документа"""
+    metadata = doc.get("metadata", {})
+    key_parts = []
+
+    if "document_id" in metadata:
+        key_parts.append(f"doc:{metadata['document_id']}")
+    if "chunk_index" in metadata:
+        key_parts.append(f"chunk:{metadata['chunk_index']}")
+
+    return "|".join(key_parts) if key_parts else str(hash(doc.get("text", "")))
+
+
+# Вспомогательные функции для анализа
+def extract_value_from_response(response: str, query: str) -> str:
+    """Извлекает значение из ответа LLM"""
+    lines = [line.strip() for line in response.split('\n') if line.strip()]
+
+    # Ищем строку с результатом
+    for line in lines:
+        if line.startswith("РЕЗУЛЬТАТ:"):
+            return line.replace("РЕЗУЛЬТАТ:", "").strip()
+
+    # Ищем строку с двоеточием
+    for line in lines:
+        if ":" in line:
+            parts = line.split(":", 1)
+            if len(parts) == 2 and parts[1].strip():
+                return parts[1].strip()
+
+    # Возвращаем последнюю строку
+    return lines[-1] if lines else "Информация не найдена"
+
+
+def calculate_confidence(response: str) -> float:
+    """Рассчитывает уверенность в ответе"""
+    uncertainty_phrases = [
+        "возможно", "вероятно", "может быть", "предположительно",
+        "не ясно", "не уверен", "не определено", "информация не найдена"
+    ]
+
+    confidence = 0.8
+    response_lower = response.lower()
+
+    for phrase in uncertainty_phrases:
+        if phrase in response_lower:
+            confidence -= 0.1
+
+    return max(0.1, min(confidence, 1.0))
+
+
+# Асинхронные функции
 async def periodic_cleanup():
     """Периодически очищает неиспользуемые кэши GPU"""
     while True:
@@ -374,6 +358,32 @@ async def periodic_cleanup():
         if active_indexing_tasks == 0:
             cleanup_gpu_memory()
             logger.info("Выполнена периодическая очистка GPU кэшей")
+
+
+async def indexing_queue_worker():
+    """Воркер для обработки очереди индексации - обрабатывает только одну задачу за раз"""
+    logger.info("Запущен обработчик очереди индексации")
+
+    while True:
+        try:
+            # Ждем задачу из очереди
+            request = await indexing_queue.get()
+
+            # Обрабатываем задачу с семафором (только одна за раз)
+            async with indexing_semaphore:
+                logger.info(f"Начало обработки задачи индексации: {request.task_id}")
+                await index_document_task_worker(request)
+                logger.info(f"Завершена обработка задачи индексации: {request.task_id}")
+
+            # Помечаем задачу как выполненную
+            indexing_queue.task_done()
+
+        except asyncio.CancelledError:
+            logger.info("Остановка обработчика очереди индексации")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в обработчике очереди индексации: {e}")
+            await asyncio.sleep(1)  # Небольшая пауза при ошибке
 
 
 async def analysis_queue_worker():
@@ -400,32 +410,60 @@ async def analysis_queue_worker():
         except Exception as e:
             logger.error(f"Ошибка в обработчике очереди анализа: {e}")
             await asyncio.sleep(1)  # Небольшая пауза при ошибке
-    """Воркер для обработки очереди индексации - обрабатывает только одну задачу за раз"""
-    logger.info("Запущен обработчик очереди индексации")
+
+
+async def search_queue_worker():
+    """Воркер для обработки очереди поисковых запросов"""
+    logger.info("Запущен обработчик очереди поиска")
 
     while True:
         try:
             # Ждем задачу из очереди
-            request = await indexing_queue.get()
+            task_data = await search_queue.get()
 
-            # Обрабатываем задачу с семафором (только одна за раз)
-            async with indexing_semaphore:
-                logger.info(f"Начало обработки задачи индексации: {request.task_id}")
-                await index_document_task_worker(request)
-                logger.info(f"Завершена обработка задачи индексации: {request.task_id}")
+            # Обрабатываем задачу с семафором
+            async with search_semaphore:
+                await _process_search_request(task_data)
 
             # Помечаем задачу как выполненную
-            indexing_queue.task_done()
+            search_queue.task_done()
 
         except asyncio.CancelledError:
-            logger.info("Остановка обработчика очереди индексации")
+            logger.info("Остановка обработчика очереди поиска")
             break
         except Exception as e:
-            logger.error(f"Ошибка в обработчике очереди индексации: {e}")
-            await asyncio.sleep(1)  # Небольшая пауза при ошибке
+            logger.error(f"Ошибка в обработчике очереди поиска: {e}")
+            # Устанавливаем ошибку в future если она есть
+            if 'future' in task_data and not task_data['future'].done():
+                task_data['future'].set_exception(e)
 
 
-# Функция для ленивой инициализации ререйтера
+async def llm_queue_worker():
+    """Воркер для обработки очереди LLM запросов"""
+    logger.info("Запущен обработчик очереди LLM")
+
+    while True:
+        try:
+            # Ждем задачу из очереди
+            task_data = await llm_queue.get()
+
+            # Обрабатываем задачу с семафором
+            async with llm_semaphore:
+                await _process_llm_request(task_data)
+
+            # Помечаем задачу как выполненную
+            llm_queue.task_done()
+
+        except asyncio.CancelledError:
+            logger.info("Остановка обработчика очереди LLM")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в обработчике очереди LLM: {e}")
+            # Устанавливаем ошибку в future если она есть
+            if 'future' in task_data and not task_data['future'].done():
+                task_data['future'].set_exception(e)
+
+
 async def get_reranker():
     """Ленивая инициализация ререйтера при первом использовании"""
     global reranker, reranker_initialized
@@ -456,7 +494,6 @@ async def get_reranker():
     return reranker
 
 
-# Асинхронные вспомогательные функции
 async def update_task_status(task_id: str, status: str, progress: int = 0,
                              stage: str = "", message: str = "", result: Any = None):
     """Асинхронно обновляет статус задачи в Redis"""
@@ -471,26 +508,6 @@ async def update_task_status(task_id: str, status: str, progress: int = 0,
 
     await redis_client.setex(f"task:{task_id}", 3600, json.dumps(task_data))
     logger.info(f"Task {task_id}: {status} - {progress}% [{stage}] {message}")
-
-
-def calculate_content_weight(content_length: int) -> float:
-    """
-    Рассчитывает вес контента на основе его длины.
-
-    Args:
-        content_length: Длина контента в символах
-
-    Returns:
-        float: Вес от 0.1 до 1.0
-    """
-    if content_length < 10:
-        return 0.1  # Почти пустые
-    elif content_length < 50:
-        return 0.5  # Короткие
-    elif content_length < 200:
-        return 0.8  # Средние
-    else:
-        return 1.0  # Полноценные
 
 
 async def process_document_with_semantic_chunker(document_path: str, application_id: str,
@@ -690,137 +707,6 @@ async def process_document_with_semantic_chunker(document_path: str, application
 
     return await loop.run_in_executor(executor, _process)
 
-# API endpoints
-@app.get("/system/status")
-async def get_system_status():
-    """Получает текущий статус системы"""
-    try:
-        status = {
-            "active_indexing_tasks": active_indexing_tasks,
-            "embeddings_loaded": False,
-            "reranker_loaded": reranker is not None,
-            "memory_info": {},
-            "queues": {
-                "indexing": indexing_queue.qsize() if indexing_queue else 0,
-                "search": search_queue.qsize(),
-                "llm": llm_queue.qsize()
-            }
-        }
-
-        # Проверяем загружены ли эмбеддинги
-        if qdrant_manager and hasattr(qdrant_manager, '_embeddings_initialized'):
-            status["embeddings_loaded"] = qdrant_manager._embeddings_initialized
-
-        # Получаем информацию о памяти
-        if torch.cuda.is_available():
-            status["memory_info"] = {
-                "allocated": f"{torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB",
-                "reserved": f"{torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB",
-                "free": f"{(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1024 ** 3:.2f} GB"
-            }
-
-        return {"status": "success", "system": status}
-
-    except Exception as e:
-        logger.error(f"Ошибка при получении статуса системы: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/queue/status")
-async def get_queue_status():
-    """Получает статус всех очередей"""
-    try:
-        return {
-            "status": "success",
-            "queues": {
-                "indexing": {
-                    "size": indexing_queue.qsize() if indexing_queue else 0,
-                    "active_tasks": active_indexing_tasks,
-                    "semaphore_available": indexing_semaphore._value if indexing_semaphore else 0
-                },
-                "search": {
-                    "size": search_queue.qsize(),
-                    "semaphore_available": search_semaphore._value,
-                    "max_concurrent": 3
-                },
-                "llm": {
-                    "size": llm_queue.qsize(),
-                    "semaphore_available": llm_semaphore._value,
-                    "max_concurrent": 1
-                }
-            }
-        }
-
-    except Exception as e:
-        logger.error(f"Ошибка при получении статуса очередей: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/queue/analysis/status")
-async def get_analysis_queue_status():
-    """Получает статус очереди анализа"""
-    try:
-        queue_size = analysis_queue.qsize() if analysis_queue else 0
-
-        # Получаем список задач в очереди
-        queue_tasks = []
-        if queue_size > 0:
-            # Примечание: это приблизительная информация, так как очередь может измениться
-            temp_list = []
-            for _ in range(queue_size):
-                try:
-                    item = analysis_queue.get_nowait()
-                    temp_list.append(item)
-                    queue_tasks.append({
-                        "task_id": item.task_id,
-                        "application_id": item.application_id
-                    })
-                except asyncio.QueueEmpty:
-                    break
-
-            # Возвращаем элементы обратно в очередь
-            for item in temp_list:
-                await analysis_queue.put(item)
-
-        return {
-            "status": "success",
-            "queue": {
-                "size": queue_size,
-                "active_task": active_analysis_tasks > 0,
-                "tasks": queue_tasks
-            }
-        }
-
-    except Exception as e:
-        logger.error(f"Ошибка при получении статуса очереди анализа: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/task/{task_id}/status")
-async def get_task_status(task_id: str):
-    """Асинхронно получает статус задачи из Redis"""
-    task_data = await redis_client.get(f"task:{task_id}")
-    if not task_data:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    return json.loads(task_data)
-
-
-@app.post("/index")
-async def index_document(request: IndexDocumentRequest):
-    """Запускает асинхронную индексацию документа"""
-    # Добавляем задачу в очередь
-    await indexing_queue.put(request)
-
-    # Обновляем статус задачи
-    await update_task_status(request.task_id, "QUEUED", 0, "queue",
-                             f"Задача добавлена в очередь. Позиция: {indexing_queue.qsize()}")
-
-    return {
-        "status": "queued",
-        "task_id": request.task_id,
-        "queue_position": indexing_queue.qsize()
-    }
 
 async def index_document_task_worker(request: IndexDocumentRequest):
     """Воркер для выполнения индексации - вызывается из очереди"""
@@ -953,42 +839,6 @@ async def index_document_task_worker(request: IndexDocumentRequest):
         cleanup_gpu_memory()
 
 
-async def index_document_task(request: IndexDocumentRequest):
-    """Устаревшая функция для совместимости"""
-    logger.warning("Использование устаревшей функции index_document_task")
-    await index_document_task_worker(request)
-
-
-@app.post("/search")
-async def search(request: SearchRequest):
-    """Асинхронно выполняет семантический поиск с контролем нагрузки"""
-    # Создаем уникальный ID для задачи
-    task_id = str(uuid.uuid4())
-
-    # Создаем Future для результата
-    future = asyncio.Future()
-
-    # Добавляем задачу в очередь
-    await search_queue.put({
-        'task_id': task_id,
-        'request': request,
-        'future': future
-    })
-
-    # Логируем размер очереди
-    queue_size = search_queue.qsize()
-    if queue_size > 0:
-        logger.info(f"Поисковый запрос добавлен в очередь. Позиция: {queue_size}")
-
-    try:
-        # Ждем результат
-        result = await future
-        return result
-    except Exception as e:
-        logger.exception(f"Ошибка поиска: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 async def _process_search_request(task_data: dict):
     """Внутренняя функция для обработки поискового запроса"""
     request = task_data['request']
@@ -1043,186 +893,51 @@ async def _process_search_request(task_data: dict):
         future.set_exception(e)
 
 
-def vector_search(application_id: str, query: str, limit: int,
-                  use_reranker: bool, rerank_limit: Optional[int]) -> List[Dict]:
-    """Векторный поиск с освобождением ресурсов"""
-    try:
-        # Получаем больше результатов для ререйтинга
-        search_limit = rerank_limit if rerank_limit else (limit * 3 if use_reranker else limit)
+async def _process_llm_request(task_data: dict):
+    """Внутренняя функция для обработки LLM запроса"""
+    request = task_data['request']
+    future = task_data['future']
 
-        # Поиск
-        docs = qdrant_manager.search(
-            query=query,
-            filter_dict={"application_id": application_id},
-            k=search_limit
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _process():
+            llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
+            return llm_provider.process_query(
+                model_name=request.model_name,
+                prompt=request.prompt,
+                context=request.context,
+                parameters=request.parameters,
+                query=request.query
+            )
+
+        response = await loop.run_in_executor(executor, _process)
+
+        # Устанавливаем результат
+        future.set_result({"status": "success", "response": response})
+
+    except Exception as e:
+        # Устанавливаем исключение
+        future.set_exception(e)
+
+
+async def process_llm_query_async(model_name: str, prompt: str, context: str,
+                                  parameters: Dict[str, Any], query: Optional[str] = None):
+    """Асинхронная обработка запроса через LLM"""
+    loop = asyncio.get_event_loop()
+
+    def _process():
+        llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
+
+        return llm_provider.process_query(
+            model_name=model_name,
+            prompt=prompt,
+            context=context,
+            parameters=parameters,
+            query=query
         )
 
-        # Преобразуем результаты
-        results = []
-        for doc in docs:
-            results.append({
-                "text": doc.page_content,
-                "metadata": doc.metadata,
-                "score": doc.metadata.get('score', 0.0),
-                "search_type": "vector"
-            })
-
-        # Ререйтинг (не загружаем модель, если не нужен)
-        if use_reranker and results:
-            # Получаем ререйтер через asyncio
-            loop = asyncio.new_event_loop()
-            current_reranker = loop.run_until_complete(get_reranker())
-            loop.close()
-
-            if current_reranker:
-                try:
-                    results = current_reranker.rerank(query, results, top_k=limit, text_key="text")
-                finally:
-                    # Ререйтер сам освобождает память в своем finally блоке
-                    pass
-
-        return results[:limit]
-    except Exception as e:
-        raise
-
-
-def hybrid_search(application_id: str, query: str, limit: int,
-                  vector_weight: float, text_weight: float, use_reranker: bool) -> List[Dict]:
-    """Гибридный поиск с освобождением ресурсов"""
-    try:
-        # Векторный поиск (без ререйтинга на этом этапе)
-        vector_results = vector_search(application_id, query, limit * 2, False, None)
-
-        # Текстовый поиск через Qdrant
-        from qdrant_client.http import models
-
-        text_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="metadata.application_id",
-                    match=models.MatchValue(value=application_id)
-                ),
-                models.FieldCondition(
-                    key="page_content",
-                    match=models.MatchText(text=query)
-                )
-            ]
-        )
-
-        text_results_raw = qdrant_manager.client.scroll(
-            collection_name=qdrant_manager.collection_name,
-            scroll_filter=text_filter,
-            limit=limit * 2,
-            with_payload=True,
-            with_vectors=False
-        )[0]
-
-        # Преобразуем текстовые результаты
-        text_results = []
-        for i, point in enumerate(text_results_raw):
-            if hasattr(point, 'payload'):
-                text_results.append({
-                    "text": point.payload.get("page_content", ""),
-                    "metadata": point.payload.get("metadata", {}),
-                    "score": 1.0 - (i * 0.05),
-                    "search_type": "text"
-                })
-
-        # Объединяем результаты
-        combined = combine_results(vector_results, text_results, vector_weight, text_weight, limit)
-
-        # Ререйтинг
-        if use_reranker and combined:
-            # Получаем ререйтер через asyncio
-            loop = asyncio.new_event_loop()
-            current_reranker = loop.run_until_complete(get_reranker())
-            loop.close()
-
-            if current_reranker:
-                try:
-                    combined = current_reranker.rerank(query, combined, top_k=limit, text_key="text")
-                finally:
-                    # Ререйтер сам освобождает память в своем finally блоке
-                    pass
-
-        return combined[:limit]
-    except Exception as e:
-        raise
-
-
-def combine_results(vector_results: List[Dict], text_results: List[Dict],
-                    vector_weight: float, text_weight: float, limit: int) -> List[Dict]:
-    """Объединяет результаты векторного и текстового поиска"""
-    # Нормализуем веса
-    total_weight = vector_weight + text_weight
-    vector_weight = vector_weight / total_weight
-    text_weight = text_weight / total_weight
-
-    # Объединяем
-    results_dict = {}
-
-    for doc in vector_results:
-        key = get_document_key(doc)
-        results_dict[key] = {
-            "doc": doc,
-            "score": doc.get("score", 0.0) * vector_weight,
-            "search_type": "hybrid"
-        }
-
-    for doc in text_results:
-        key = get_document_key(doc)
-        if key in results_dict:
-            results_dict[key]["score"] += doc.get("score", 0.0) * text_weight
-        else:
-            results_dict[key] = {
-                "doc": doc,
-                "score": doc.get("score", 0.0) * text_weight,
-                "search_type": "hybrid"
-            }
-
-    # Сортируем
-    sorted_results = sorted(results_dict.values(), key=lambda x: x["score"], reverse=True)
-
-    # Преобразуем обратно
-    combined = []
-    for item in sorted_results[:limit]:
-        doc = item["doc"].copy()
-        doc["score"] = item["score"]
-        doc["search_type"] = "hybrid"
-        combined.append(doc)
-
-    return combined
-
-
-def get_document_key(doc: Dict) -> str:
-    """Создает уникальный ключ для документа"""
-    metadata = doc.get("metadata", {})
-    key_parts = []
-
-    if "document_id" in metadata:
-        key_parts.append(f"doc:{metadata['document_id']}")
-    if "chunk_index" in metadata:
-        key_parts.append(f"chunk:{metadata['chunk_index']}")
-
-    return "|".join(key_parts) if key_parts else str(hash(doc.get("text", "")))
-
-
-@app.post("/analyze")
-async def analyze_application(request: AnalyzeApplicationRequest):
-    """Добавляет задачу анализа в очередь"""
-    # Добавляем задачу в очередь
-    await analysis_queue.put(request)
-
-    # Обновляем статус задачи
-    queue_position = analysis_queue.qsize()
-    await update_task_status(request.task_id, "QUEUED", 0, "queue",
-                           f"Задача добавлена в очередь анализа. Позиция: {queue_position}")
-
-    return {
-        "status": "queued",
-        "task_id": request.task_id,
-        "queue_position": queue_position
-    }
+    return await loop.run_in_executor(executor, _process)
 
 
 async def analyze_application_task_worker(request: AnalyzeApplicationRequest):
@@ -1440,98 +1155,476 @@ async def analyze_application_task_worker(request: AnalyzeApplicationRequest):
         cleanup_gpu_memory()
 
 
-# Вспомогательные функции для анализа
-def extract_value_from_response(response: str, query: str) -> str:
-    """Извлекает значение из ответа LLM"""
-    lines = [line.strip() for line in response.split('\n') if line.strip()]
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global redis_client, qdrant_manager, reranker_semaphore, indexing_lock, indexing_queue, indexing_semaphore
+    global analysis_queue, analysis_semaphore, analysis_lock, analysis_search_semaphore, analysis_llm_semaphore
 
-    # Ищем строку с результатом
-    for line in lines:
-        if line.startswith("РЕЗУЛЬТАТ:"):
-            return line.replace("РЕЗУЛЬТАТ:", "").strip()
+    # Инициализация семафора для ререйтера
+    reranker_semaphore = asyncio.Semaphore(1)
 
-    # Ищем строку с двоеточием
-    for line in lines:
-        if ":" in line:
-            parts = line.split(":", 1)
-            if len(parts) == 2 and parts[1].strip():
-                return parts[1].strip()
+    # Инициализация блокировки для счетчика индексаций
+    indexing_lock = asyncio.Lock()
 
-    # Возвращаем последнюю строку
-    return lines[-1] if lines else "Информация не найдена"
+    # Инициализация очереди для задач индексации
+    indexing_queue = asyncio.Queue()
 
+    # Семафор для ограничения одной индексации за раз
+    indexing_semaphore = asyncio.Semaphore(1)
 
-def calculate_confidence(response: str) -> float:
-    """Рассчитывает уверенность в ответе"""
-    uncertainty_phrases = [
-        "возможно", "вероятно", "может быть", "предположительно",
-        "не ясно", "не уверен", "не определено", "информация не найдена"
-    ]
+    # Инициализация для анализа
+    analysis_queue = asyncio.Queue()
+    analysis_semaphore = asyncio.Semaphore(1)  # Один анализ за раз
+    analysis_lock = asyncio.Lock()
+    analysis_search_semaphore = asyncio.Semaphore(3)  # До 3 параллельных поисков в анализе
+    analysis_llm_semaphore = asyncio.Semaphore(1)  # Один LLM запрос за раз в анализе
 
-    confidence = 0.8
-    response_lower = response.lower()
+    # Инициализация Redis с асинхронным клиентом
+    redis_client = await redis.from_url("redis://localhost:6379", decode_responses=True)
+    logger.info("Redis клиент инициализирован")
 
-    for phrase in uncertainty_phrases:
-        if phrase in response_lower:
-            confidence -= 0.1
-
-    return max(0.1, min(confidence, 1.0))
-
-
-async def process_llm_query_async(model_name: str, prompt: str, context: str,
-                                  parameters: Dict[str, Any], query: Optional[str] = None):
-    """Асинхронная обработка запроса через LLM"""
+    # Инициализация QdrantManager БЕЗ загрузки моделей
     loop = asyncio.get_event_loop()
-
-    def _process():
-        llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
-
-        return llm_provider.process_query(
-            model_name=model_name,
-            prompt=prompt,
-            context=context,
-            parameters=parameters,
-            query=query
+    qdrant_manager = await loop.run_in_executor(
+        executor,
+        lambda: QdrantManager(
+            collection_name="ppee_applications",
+            host="localhost",
+            port=6333,
+            embeddings_type="ollama",
+            model_name="bge-m3",
+            ollama_url="http://localhost:11434",
+            check_availability=False,  # ВАЖНО: Отключаем проверку при старте
+            ollama_keep_alive=OLLAMA_KEEP_ALIVE  # Время хранения модели в памяти из переменной окружения
         )
+    )
+    logger.info("QdrantManager инициализирован")
 
-    return await loop.run_in_executor(executor, _process)
-
-
-@app.post("/llm/process")
-async def process_llm_query(request: ProcessQueryRequest):
-    """Асинхронно обрабатывает запрос через LLM"""
+    # СОЗДАНИЕ КОЛЛЕКЦИИ
+    logger.info("Проверка и создание коллекции Qdrant...")
     try:
-        response = await process_llm_query_async(
-            request.model_name,
-            request.prompt,
-            request.context,
-            request.parameters,
-            request.query
+        # Получаем список существующих коллекций
+        collections_response = await loop.run_in_executor(
+            executor,
+            lambda: qdrant_manager.client.get_collections()
         )
 
-        return {"status": "success", "response": response}
+        existing_collections = [c.name for c in collections_response.collections]
+        logger.info(f"Существующие коллекции: {existing_collections}")
+
+        # Проверяем, существует ли наша коллекция
+        if qdrant_manager.collection_name not in existing_collections:
+            logger.info(f"Коллекция '{qdrant_manager.collection_name}' не найдена. Создаем...")
+
+            # Создаем коллекцию
+            from qdrant_client.http import models
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_collection(
+                    collection_name=qdrant_manager.collection_name,
+                    vectors_config=models.VectorParams(
+                        size=qdrant_manager.vector_size,
+                        distance=models.Distance.COSINE
+                    )
+                )
+            )
+            logger.info(f"Коллекция '{qdrant_manager.collection_name}' создана")
+
+            # Создаем индексы для оптимизации поиска
+            logger.info("Создание индексов...")
+
+            # Индекс для application_id
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_payload_index(
+                    collection_name=qdrant_manager.collection_name,
+                    field_name="metadata.application_id",
+                    field_schema="keyword"
+                )
+            )
+
+            # Индекс для content_type
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_payload_index(
+                    collection_name=qdrant_manager.collection_name,
+                    field_name="metadata.content_type",
+                    field_schema="keyword"
+                )
+            )
+
+            # Полнотекстовый индекс для page_content
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_payload_index(
+                    collection_name=qdrant_manager.collection_name,
+                    field_name="page_content",
+                    field_schema="text"
+                )
+            )
+
+            # НОВЫЕ ИНДЕКСЫ ДЛЯ ФИЛЬТРАЦИИ ПУСТЫХ ЧАНКОВ
+            # Индекс для фильтрации пустых чанков
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_payload_index(
+                    collection_name=qdrant_manager.collection_name,
+                    field_name="metadata.is_empty",
+                    field_schema="bool"
+                )
+            )
+            logger.info("Индекс для metadata.is_empty создан")
+
+            # Индекс для фильтрации по длине контента
+            await loop.run_in_executor(
+                executor,
+                lambda: qdrant_manager.client.create_payload_index(
+                    collection_name=qdrant_manager.collection_name,
+                    field_name="metadata.content_length",
+                    field_schema="integer"
+                )
+            )
+            logger.info("Индекс для metadata.content_length создан")
+
+            logger.info("Все индексы созданы успешно")
+
+        else:
+            logger.info(f"Коллекция '{qdrant_manager.collection_name}' уже существует")
+
+            # Проверяем и создаем недостающие индексы
+            try:
+                collection_info = await loop.run_in_executor(
+                    executor,
+                    lambda: qdrant_manager.client.get_collection(qdrant_manager.collection_name)
+                )
+
+                # Список необходимых индексов
+                required_indices = {
+                    "metadata.application_id": "keyword",
+                    "metadata.content_type": "keyword",
+                    "page_content": "text",
+                    "metadata.is_empty": "bool",
+                    "metadata.content_length": "integer",
+                    "metadata.content_weight": "float"
+                }
+
+                # Проверяем наличие полнотекстового индекса
+                if hasattr(collection_info, 'payload_schema'):
+                    existing_indices = set(collection_info.payload_schema.keys()) if collection_info.payload_schema else set()
+
+                    # Создаем недостающие индексы
+                    for field_name, field_schema in required_indices.items():
+                        if field_name not in existing_indices:
+                            logger.info(f"Создание недостающего индекса для {field_name}...")
+                            try:
+                                await loop.run_in_executor(
+                                    executor,
+                                    lambda fn=field_name, fs=field_schema: qdrant_manager.client.create_payload_index(
+                                        collection_name=qdrant_manager.collection_name,
+                                        field_name=fn,
+                                        field_schema=fs
+                                    )
+                                )
+                                logger.info(f"Индекс для {field_name} создан")
+                            except Exception as idx_error:
+                                logger.warning(f"Не удалось создать индекс для {field_name}: {idx_error}")
+
+            except Exception as e:
+                logger.warning(f"Не удалось проверить индексы: {e}")
+
+        # Получаем информацию о коллекции
+        collection_info = await loop.run_in_executor(
+            executor,
+            lambda: qdrant_manager.client.get_collection(qdrant_manager.collection_name)
+        )
+
+        logger.info(f"Коллекция готова к работе. Статус: {collection_info.status}, "
+                    f"Векторов: {collection_info.vectors_count}")
 
     except Exception as e:
-        logger.exception(f"Ошибка LLM: {e}")
+        logger.error(f"Критическая ошибка при создании коллекции: {e}")
+
+    # НЕ инициализируем ререйтер при старте
+    logger.info("Сервис запущен. Модели будут загружены при первом использовании.")
+
+    # Запускаем периодическую очистку памяти
+    cleanup_task = asyncio.create_task(periodic_cleanup())
+
+    # Запускаем обработчик очереди индексации
+    indexing_worker_task = asyncio.create_task(indexing_queue_worker())
+
+    # Запускаем обработчик очереди анализа
+    analysis_worker_task = asyncio.create_task(analysis_queue_worker())
+
+    # Запускаем обработчики очередей для эндпоинтов
+    search_worker_task = asyncio.create_task(search_queue_worker())
+    llm_worker_task = asyncio.create_task(llm_queue_worker())
+
+    yield
+
+    # Shutdown
+    logger.info("Начало остановки сервиса...")
+
+    # Отменяем фоновые задачи
+    cleanup_task.cancel()
+    indexing_worker_task.cancel()
+    analysis_worker_task.cancel()
+    search_worker_task.cancel()
+    llm_worker_task.cancel()
+
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+    try:
+        await indexing_worker_task
+    except asyncio.CancelledError:
+        pass
+
+    try:
+        await analysis_worker_task
+    except asyncio.CancelledError:
+        pass
+
+    try:
+        await search_worker_task
+    except asyncio.CancelledError:
+        pass
+
+    try:
+        await llm_worker_task
+    except asyncio.CancelledError:
+        pass
+
+    # Ожидаем завершения всех задач в очереди
+    if indexing_queue.qsize() > 0:
+        logger.info(f"Ожидание завершения {indexing_queue.qsize()} задач в очереди...")
+        await indexing_queue.join()
+
+    if analysis_queue.qsize() > 0:
+        logger.info(f"Ожидание завершения {analysis_queue.qsize()} задач анализа...")
+        await analysis_queue.join()
+
+    if search_queue.qsize() > 0:
+        logger.info(f"Ожидание завершения {search_queue.qsize()} поисковых запросов...")
+        await search_queue.join()
+
+    if llm_queue.qsize() > 0:
+        logger.info(f"Ожидание завершения {llm_queue.qsize()} LLM запросов...")
+        await llm_queue.join()
+
+    # Завершаем executor
+    executor.shutdown(wait=True)
+
+    # Очищаем ресурсы ререйтера если он был инициализирован
+    if reranker:
+        await loop.run_in_executor(executor, reranker.cleanup)
+        cleanup_gpu_memory()
+
+    # Очищаем ресурсы QdrantManager
+    if qdrant_manager:
+        await loop.run_in_executor(executor, qdrant_manager.cleanup)
+
+    # Закрываем Redis соединение
+    await redis_client.close()
+
+    logger.info("Сервис остановлен")
+
+
+app = FastAPI(lifespan=lifespan)
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Разрешаем все источники для тестирования
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# API endpoints
+@app.get("/system/status")
+async def get_system_status():
+    """Получает текущий статус системы"""
+    try:
+        status = {
+            "active_indexing_tasks": active_indexing_tasks,
+            "embeddings_loaded": False,
+            "reranker_loaded": reranker is not None,
+            "memory_info": {},
+            "queues": {
+                "indexing": indexing_queue.qsize() if indexing_queue else 0,
+                "search": search_queue.qsize(),
+                "llm": llm_queue.qsize()
+            }
+        }
+
+        # Проверяем загружены ли эмбеддинги
+        if qdrant_manager and hasattr(qdrant_manager, '_embeddings_initialized'):
+            status["embeddings_loaded"] = qdrant_manager._embeddings_initialized
+
+        # Получаем информацию о памяти
+        if torch.cuda.is_available():
+            status["memory_info"] = {
+                "allocated": f"{torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB",
+                "reserved": f"{torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB",
+                "free": f"{(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1024 ** 3:.2f} GB"
+            }
+
+        return {"status": "success", "system": status}
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении статуса системы: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/llm/models")
-async def get_llm_models():
-    """Асинхронно получает список доступных LLM моделей"""
+@app.get("/queue/status")
+async def get_queue_status():
+    """Получает статус всех очередей"""
     try:
-        loop = asyncio.get_event_loop()
-
-        def _get_models():
-            llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
-            return llm_provider.get_available_models()
-
-        models = await loop.run_in_executor(executor, _get_models)
-        return {"status": "success", "models": models}
+        return {
+            "status": "success",
+            "queues": {
+                "indexing": {
+                    "size": indexing_queue.qsize() if indexing_queue else 0,
+                    "active_tasks": active_indexing_tasks,
+                    "semaphore_available": indexing_semaphore._value if indexing_semaphore else 0
+                },
+                "search": {
+                    "size": search_queue.qsize(),
+                    "semaphore_available": search_semaphore._value,
+                    "max_concurrent": 3
+                },
+                "llm": {
+                    "size": llm_queue.qsize(),
+                    "semaphore_available": llm_semaphore._value,
+                    "max_concurrent": 1
+                }
+            }
+        }
 
     except Exception as e:
-        logger.exception(f"Ошибка получения моделей: {e}")
+        logger.error(f"Ошибка при получении статуса очередей: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/queue/analysis/status")
+async def get_analysis_queue_status():
+    """Получает статус очереди анализа"""
+    try:
+        queue_size = analysis_queue.qsize() if analysis_queue else 0
+
+        # Получаем список задач в очереди
+        queue_tasks = []
+        if queue_size > 0:
+            # Примечание: это приблизительная информация, так как очередь может измениться
+            temp_list = []
+            for _ in range(queue_size):
+                try:
+                    item = analysis_queue.get_nowait()
+                    temp_list.append(item)
+                    queue_tasks.append({
+                        "task_id": item.task_id,
+                        "application_id": item.application_id
+                    })
+                except asyncio.QueueEmpty:
+                    break
+
+            # Возвращаем элементы обратно в очередь
+            for item in temp_list:
+                await analysis_queue.put(item)
+
+        return {
+            "status": "success",
+            "queue": {
+                "size": queue_size,
+                "active_task": active_analysis_tasks > 0,
+                "tasks": queue_tasks
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении статуса очереди анализа: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/task/{task_id}/status")
+async def get_task_status(task_id: str):
+    """Асинхронно получает статус задачи из Redis"""
+    task_data = await redis_client.get(f"task:{task_id}")
+    if not task_data:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return json.loads(task_data)
+
+
+@app.post("/index")
+async def index_document(request: IndexDocumentRequest):
+    """Запускает асинхронную индексацию документа"""
+    # Добавляем задачу в очередь
+    await indexing_queue.put(request)
+
+    # Обновляем статус задачи
+    await update_task_status(request.task_id, "QUEUED", 0, "queue",
+                             f"Задача добавлена в очередь. Позиция: {indexing_queue.qsize()}")
+
+    return {
+        "status": "queued",
+        "task_id": request.task_id,
+        "queue_position": indexing_queue.qsize()
+    }
+
+
+@app.post("/search")
+async def search(request: SearchRequest):
+    """Асинхронно выполняет семантический поиск с контролем нагрузки"""
+    # Создаем уникальный ID для задачи
+    task_id = str(uuid.uuid4())
+
+    # Создаем Future для результата
+    future = asyncio.Future()
+
+    # Добавляем задачу в очередь
+    await search_queue.put({
+        'task_id': task_id,
+        'request': request,
+        'future': future
+    })
+
+    # Логируем размер очереди
+    queue_size = search_queue.qsize()
+    if queue_size > 0:
+        logger.info(f"Поисковый запрос добавлен в очередь. Позиция: {queue_size}")
+
+    try:
+        # Ждем результат
+        result = await future
+        return result
+    except Exception as e:
+        logger.exception(f"Ошибка поиска: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze")
+async def analyze_application(request: AnalyzeApplicationRequest):
+    """Добавляет задачу анализа в очередь"""
+    # Добавляем задачу в очередь
+    await analysis_queue.put(request)
+
+    # Обновляем статус задачи
+    queue_position = analysis_queue.qsize()
+    await update_task_status(request.task_id, "QUEUED", 0, "queue",
+                           f"Задача добавлена в очередь анализа. Позиция: {queue_position}")
+
+    return {
+        "status": "queued",
+        "task_id": request.task_id,
+        "queue_position": queue_position
+    }
 
 
 @app.post("/llm/process")
@@ -1564,32 +1657,22 @@ async def process_llm_query(request: ProcessQueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def _process_llm_request(task_data: dict):
-    """Внутренняя функция для обработки LLM запроса"""
-    request = task_data['request']
-    future = task_data['future']
-
+@app.get("/llm/models")
+async def get_llm_models():
+    """Асинхронно получает список доступных LLM моделей"""
     try:
         loop = asyncio.get_event_loop()
 
-        def _process():
+        def _get_models():
             llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
-            return llm_provider.process_query(
-                model_name=request.model_name,
-                prompt=request.prompt,
-                context=request.context,
-                parameters=request.parameters,
-                query=request.query
-            )
+            return llm_provider.get_available_models()
 
-        response = await loop.run_in_executor(executor, _process)
-
-        # Устанавливаем результат
-        future.set_result({"status": "success", "response": response})
+        models = await loop.run_in_executor(executor, _get_models)
+        return {"status": "success", "models": models}
 
     except Exception as e:
-        # Устанавливаем исключение
-        future.set_exception(e)
+        logger.exception(f"Ошибка получения моделей: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/applications/{application_id}/stats")
