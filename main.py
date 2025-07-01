@@ -506,7 +506,7 @@ async def update_task_status(task_id: str, status: str, progress: int = 0,
     if result is not None:
         task_data["result"] = result
 
-    await redis_client.setex(f"task:{task_id}", 3600, json.dumps(task_data))
+    await redis_client.setex(f"task:{task_id}", 7200, json.dumps(task_data))
     logger.info(f"Task {task_id}: {status} - {progress}% [{stage}] {message}")
 
 

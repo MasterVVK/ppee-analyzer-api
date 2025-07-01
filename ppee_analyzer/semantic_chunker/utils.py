@@ -139,3 +139,38 @@ def generate_unique_id() -> str:
         str: Уникальный идентификатор
     """
     return str(uuid.uuid4())
+
+
+def decode_unicode_escapes(text: str) -> str:
+    """
+    Декодирует Unicode escape sequences в тексте.
+    Например: /uni041F -> П, /uni044F -> я
+
+    Args:
+        text: Текст с Unicode escape sequences
+
+    Returns:
+        str: Декодированный текст
+    """
+    if not text:
+        return text
+
+    import re
+
+    def replace_unicode(match):
+        # Извлекаем hex код
+        hex_code = match.group(1)
+        try:
+            # Преобразуем в символ
+            return chr(int(hex_code, 16))
+        except ValueError:
+            # Если не удалось, возвращаем как есть
+            return match.group(0)
+
+    # Паттерн для поиска /uniXXXX
+    pattern = r'/uni([0-9A-Fa-f]{4})'
+
+    # Заменяем все вхождения
+    decoded_text = re.sub(pattern, replace_unicode, text)
+
+    return decoded_text

@@ -18,7 +18,8 @@ from .utils import (
     is_likely_table_continuation,
     identify_content_type,
     extract_section_info,
-    generate_unique_id
+    generate_unique_id,
+    decode_unicode_escapes  # Импорт функции декодирования
 )
 
 # Импорты для интеграции с ppee_analyzer
@@ -31,14 +32,20 @@ logger = logging.getLogger(__name__)
 class SemanticChunker:
     """Класс для семантического разделения документов с использованием docling"""
 
-    def __init__(self, use_gpu: bool = None, threads: int = 8):
+    def __init__(self, use_gpu: bool = None, threads: int = 16, ocr_languages: List[str] = None):
         """
         Инициализирует чанкер для семантического разделения документов.
 
         Args:
             use_gpu: Использовать ли GPU (None - автоопределение)
             threads: Количество потоков
+            ocr_languages: Список языков для OCR (по умолчанию ["ru", "en"])
         """
+        # Устанавливаем OMP_NUM_THREADS перед импортом docling
+        import os
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+        logger.info(f"Установлено OMP_NUM_THREADS={threads}")
+
         # Проверяем доступность docling
         self.docling_available = detect_docling_availability()
         if not self.docling_available:
@@ -46,10 +53,11 @@ class SemanticChunker:
 
         self.use_gpu = use_gpu
         self.threads = threads
+        self.ocr_languages = ocr_languages or ["ru", "en"]  # По умолчанию русский и английский
         self._converter = None  # Ленивая инициализация
         self._converter_initialized = False
 
-        logger.info(f"SemanticChunker инициализирован (ленивая загрузка)")
+        logger.info(f"SemanticChunker инициализирован (ленивая загрузка), OCR языки: {self.ocr_languages}")
 
     @property
     def converter(self):
@@ -61,7 +69,13 @@ class SemanticChunker:
             import docling
             from docling.document_converter import DocumentConverter, PdfFormatOption
             from docling.datamodel.base_models import InputFormat
-            from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorDevice, AcceleratorOptions
+            from docling.datamodel.pipeline_options import (
+                PdfPipelineOptions,
+                AcceleratorDevice,
+                AcceleratorOptions,
+                TableFormerMode,
+                EasyOcrOptions
+            )
 
             # Проверяем доступность GPU
             if self.use_gpu is None:
@@ -76,12 +90,52 @@ class SemanticChunker:
             # Настраиваем опции обработки PDF
             pipeline_options = PdfPipelineOptions()
             pipeline_options.accelerator_options = accelerator_options
+
+            # КРИТИЧНО ДЛЯ ППЭЭ: Включаем обработку таблиц
             pipeline_options.do_table_structure = True
             pipeline_options.table_structure_options.do_cell_matching = True
+            pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
+            logger.info("Режим таблиц установлен: ACCURATE (важно для технических таблиц ППЭЭ)")
 
-            # Если используем GPU, включаем Flash Attention 2
+            # Настройка OCR для русского и английского языков
+            ocr_options = EasyOcrOptions()
+            ocr_options.lang = self.ocr_languages
+            ocr_options.force_full_page_ocr = False  # OCR только для изображений
+            ocr_options.bitmap_area_threshold = 0.03  # 3% - для мелких схем и таблиц в ППЭЭ
+            ocr_options.confidence_threshold = 0.5    # Стандартный порог
+            ocr_options.recog_network = 'standard'   # Стандартная сеть распознавания
+
+            pipeline_options.ocr_options = ocr_options
+            logger.info(f"OCR настроен для ППЭЭ: языки {self.ocr_languages}, порог площади 3%")
+            logger.info(f"OCR будет использовать устройство: {accelerator_options.device}")
+
+            # GPU оптимизации
             if self.use_gpu:
                 pipeline_options.accelerator_options.cuda_use_flash_attention2 = True
+                logger.info("Flash Attention 2 включен для GPU")
+
+            # НАСТРОЙКИ СПЕЦИАЛЬНО ДЛЯ ППЭЭ:
+
+            # Обязательно включаем
+            pipeline_options.do_ocr = True  # OCR для сканированных частей
+            pipeline_options.do_table_structure = True  # Структура таблиц критична
+
+            # Включаем для ППЭЭ
+            pipeline_options.do_formula_enrichment = True  # ВАЖНО: химические формулы, расчеты
+            logger.info("Распознавание формул ВКЛЮЧЕНО (для химических формул в ППЭЭ)")
+
+            # Отключаем ненужное для ППЭЭ
+            #pipeline_options.do_code_enrichment = False  # В ППЭЭ нет кода
+            #pipeline_options.do_picture_classification = False  # Не критично
+            #pipeline_options.do_picture_description = False  # Слишком медленно
+
+            # Отключаем генерацию изображений для скорости
+            #pipeline_options.generate_page_images = False
+            #pipeline_options.generate_picture_images = False
+            #pipeline_options.generate_table_images = False
+
+            # Дополнительные настройки
+            #pipeline_options.force_backend_text = False
 
             # Настраиваем конвертер Docling
             self._converter = DocumentConverter(
@@ -93,7 +147,9 @@ class SemanticChunker:
             )
 
             self._converter_initialized = True
-            logger.info(f"Docling конвертер инициализирован (GPU: {self.use_gpu}, потоков: {self.threads})")
+            logger.info(f"Docling конвертер инициализирован для ППЭЭ документов")
+            logger.info(f"Настройки: GPU={self.use_gpu}, потоки={self.threads}, "
+                       f"OCR={self.ocr_languages}, формулы=ВКЛ, таблицы=ACCURATE")
 
         return self._converter
 
@@ -111,6 +167,10 @@ class SemanticChunker:
             raise FileNotFoundError(f"Файл не найден: {pdf_path}")
 
         logger.info(f"Начало обработки документа: {pdf_path}")
+
+        # Проверяем OMP_NUM_THREADS
+        omp_threads = os.environ.get("OMP_NUM_THREADS", "не установлено")
+        logger.info(f"OMP_NUM_THREADS = {omp_threads}")
 
         # Конвертируем PDF с помощью Docling
         result = self.converter.convert(pdf_path)
@@ -143,6 +203,9 @@ class SemanticChunker:
             # Проверяем, есть ли у элемента атрибут label
             if not hasattr(element, 'label'):
                 if hasattr(element, 'text') and element.text.strip():
+                    # Декодируем Unicode escapes
+                    decoded_text = decode_unicode_escapes(element.text)
+
                     if current_chunk["content"]:
                         # Преобразуем set в sorted list перед добавлением
                         chunk_to_add = current_chunk.copy()
@@ -151,7 +214,7 @@ class SemanticChunker:
                         chunks.append(chunk_to_add)
 
                     current_chunk = {
-                        "content": element.text,
+                        "content": decoded_text,
                         "type": "unknown",
                         "page": current_page,
                         "heading": None,
@@ -171,7 +234,7 @@ class SemanticChunker:
                         chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
                     chunks.append(chunk_to_add)
 
-                last_caption = element.text if hasattr(element, 'text') else str(element)
+                last_caption = decode_unicode_escapes(element.text) if hasattr(element, 'text') else str(element)
                 current_chunk = {
                     "content": "",
                     "type": None,
@@ -189,19 +252,22 @@ class SemanticChunker:
                 table_content = ""
                 try:
                     table_content = element.export_to_markdown(doc=document)
+                    table_content = decode_unicode_escapes(table_content)
                 except:
                     try:
                         df = element.export_to_dataframe()
                         table_content = df.to_string()
+                        table_content = decode_unicode_escapes(table_content)
                     except:
                         table_content = str(element.data) if hasattr(element, 'data') else str(element)
+                        table_content = decode_unicode_escapes(table_content)
 
                 # Если есть caption, добавляем его
                 if hasattr(element, 'caption_text'):
                     try:
                         caption = element.caption_text(document)
                         if caption and not last_caption:
-                            last_caption = caption
+                            last_caption = decode_unicode_escapes(caption)
                     except:
                         pass
 
@@ -250,6 +316,8 @@ class SemanticChunker:
 
                 # Начинаем новый чанк с заголовком
                 heading_text = element.text if hasattr(element, 'text') else str(element)
+                heading_text = decode_unicode_escapes(heading_text)
+
                 current_chunk = {
                     "content": heading_text,
                     "type": "heading",
@@ -272,10 +340,11 @@ class SemanticChunker:
 
                 content = ""
                 if hasattr(element, 'text'):
-                    content = element.text
+                    content = decode_unicode_escapes(element.text)
                 elif hasattr(element, 'export_to_markdown'):
                     try:
                         content = element.export_to_markdown(doc=document)
+                        content = decode_unicode_escapes(content)
                     except:
                         content = str(element)
                 else:
@@ -310,12 +379,13 @@ class SemanticChunker:
                             chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
                         chunks.append(chunk_to_add)
 
-                    last_caption = element.text
+                    last_caption = decode_unicode_escapes(element.text)
                     continue
 
                 # Обычный текст или параграф
                 current_table = None
                 text_content = element.text if hasattr(element, 'text') else str(element)
+                text_content = decode_unicode_escapes(text_content)
 
                 if current_chunk["type"] == "heading":
                     # Если предыдущий элемент был заголовком, преобразуем в секцию
@@ -362,6 +432,8 @@ class SemanticChunker:
             else:
                 # Для всех остальных типов элементов
                 if hasattr(element, 'text') and element.text.strip():
+                    decoded_text = decode_unicode_escapes(element.text)
+
                     if current_chunk["content"]:
                         chunk_to_add = current_chunk.copy()
                         if isinstance(chunk_to_add.get("all_pages"), set):
@@ -369,7 +441,7 @@ class SemanticChunker:
                         chunks.append(chunk_to_add)
 
                     current_chunk = {
-                        "content": element.text,
+                        "content": decoded_text,
                         "type": element.label,
                         "page": current_page,
                         "heading": None,
@@ -619,24 +691,6 @@ class SemanticChunker:
         current_page_chunks = []
         current_page = None
         last_table_caption = None
-
-        # Проверяем, является ли блок продолжением таблицы
-        def is_likely_table_continuation(content: str) -> bool:
-            # Признаки продолжения таблицы
-            table_indicators = [
-                r'\d+\.\s*\w+',  # Нумерация (29. Конструкция выпуска)
-                r'^\d+',  # Начинается с числа
-                r'Координаты:',  # Специфические слова
-                r'^\s*[А-Яа-я\s\-]+$',  # Только текст (возможно заголовок колонки)
-                r'соответствии',  # Признак продолжения текста
-                r'^[А-Я][а-я]+\s+с',  # Начинается с заглавной буквы и предлога
-                r'\|\s*$',  # Признак таблицы
-            ]
-
-            for indicator in table_indicators:
-                if re.search(indicator, content.strip()[:100]):
-                    return True
-            return False
 
         # ОТЛАДКА: Логируем входные чанки
         logger.info(f"group_semantic_chunks: получено {len(chunks)} чанков")
