@@ -1692,46 +1692,155 @@ async def get_application_stats(application_id: str):
 
 
 @app.get("/applications/{application_id}/chunks")
-async def get_application_chunks(application_id: str, limit: int = 500):
-    """Асинхронно получает чанки заявки"""
+async def get_application_chunks(application_id: str, limit: int = 500, offset: int = 0):
+    """
+    Асинхронно получает чанки заявки с поддержкой пагинации.
+
+    Args:
+        application_id: ID заявки
+        limit: Максимальное количество чанков (по умолчанию 500, максимум 10000)
+        offset: Смещение для пагинации (по умолчанию 0)
+
+    Returns:
+        Dict с чанками и информацией о пагинации
+    """
     try:
+        # Ограничиваем максимальный limit для защиты от перегрузки
+        limit = min(limit, 10000)
+
         loop = asyncio.get_event_loop()
 
         def _get_chunks():
             from qdrant_client.http import models
 
-            response = qdrant_manager.client.scroll(
-                collection_name=qdrant_manager.collection_name,
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="metadata.application_id",
-                            match=models.MatchValue(value=application_id)
-                        )
-                    ]
-                ),
-                limit=limit,
-                with_payload=True,
-                with_vectors=False
+            # Создаем фильтр для заявки
+            application_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="metadata.application_id",
+                        match=models.MatchValue(value=application_id)
+                    )
+                ]
             )
 
-            # Преобразуем результаты
-            chunks = []
-            for point in response[0]:
-                if hasattr(point, 'payload'):
-                    chunk = {
-                        "id": point.id,
-                        "text": point.payload.get("page_content", ""),
-                        "metadata": point.payload.get("metadata", {})
-                    }
-                    chunks.append(chunk)
+            # Сначала получаем общее количество чанков
+            count_response = qdrant_manager.client.count(
+                collection_name=qdrant_manager.collection_name,
+                count_filter=application_filter,
+                exact=True
+            )
+            total_count = count_response.count
 
-            # Сортируем по chunk_index
-            chunks.sort(key=lambda x: x["metadata"].get("chunk_index", 0))
-            return chunks
+            # Если offset больше или равен общему количеству, возвращаем пустой результат
+            if offset >= total_count:
+                return {
+                    "chunks": [],
+                    "total": total_count,
+                    "offset": offset,
+                    "limit": limit,
+                    "has_more": False
+                }
 
-        chunks = await loop.run_in_executor(executor, _get_chunks)
-        return {"status": "success", "chunks": chunks}
+            # Для небольших датасетов или первой страницы - простой подход
+            if total_count <= 1000 or (offset == 0 and limit <= 1000):
+                response = qdrant_manager.client.scroll(
+                    collection_name=qdrant_manager.collection_name,
+                    scroll_filter=application_filter,
+                    limit=total_count if total_count <= 1000 else offset + limit,
+                    with_payload=True,
+                    with_vectors=False
+                )
+
+                all_points = response[0]
+
+                # Преобразуем в чанки
+                all_chunks = []
+                for point in all_points:
+                    if hasattr(point, 'payload'):
+                        chunk = {
+                            "id": str(point.id),
+                            "text": point.payload.get("page_content", ""),
+                            "metadata": point.payload.get("metadata", {})
+                        }
+                        all_chunks.append(chunk)
+
+                # Сортируем по chunk_index
+                all_chunks.sort(key=lambda x: x["metadata"].get("chunk_index", 0))
+
+                # Применяем пагинацию
+                paginated_chunks = all_chunks[offset:offset + limit]
+
+            else:
+                # Для больших датасетов с большим offset - используем scroll с итерациями
+                all_chunks = []
+                next_offset = None
+                collected = 0
+
+                # Собираем чанки пока не наберем нужное количество
+                while collected < offset + limit:
+                    batch_size = min(1000, offset + limit - collected)
+
+                    response = qdrant_manager.client.scroll(
+                        collection_name=qdrant_manager.collection_name,
+                        scroll_filter=application_filter,
+                        limit=batch_size,
+                        offset=next_offset,
+                        with_payload=True,
+                        with_vectors=False
+                    )
+
+                    points, next_offset = response
+
+                    if not points:
+                        break
+
+                    # Преобразуем батч
+                    for point in points:
+                        if hasattr(point, 'payload'):
+                            chunk = {
+                                "id": str(point.id),
+                                "text": point.payload.get("page_content", ""),
+                                "metadata": point.payload.get("metadata", {})
+                            }
+                            all_chunks.append(chunk)
+
+                    collected += len(points)
+
+                    # Если больше нет данных
+                    if next_offset is None or len(points) < batch_size:
+                        break
+
+                # Сортируем все собранные чанки
+                all_chunks.sort(key=lambda x: x["metadata"].get("chunk_index", 0))
+
+                # Применяем offset и limit
+                paginated_chunks = all_chunks[offset:offset + limit]
+
+            return {
+                "chunks": paginated_chunks,
+                "total": total_count,
+                "offset": offset,
+                "limit": limit,
+                "has_more": offset + limit < total_count
+            }
+
+        result = await loop.run_in_executor(executor, _get_chunks)
+
+        # Логируем для отладки
+        logger.info(f"Возвращено {len(result['chunks'])} чанков из {result['total']} "
+                    f"(offset={offset}, limit={limit})")
+
+        return {
+            "status": "success",
+            "chunks": result["chunks"],
+            "pagination": {
+                "total": result["total"],
+                "offset": result["offset"],
+                "limit": result["limit"],
+                "has_more": result["has_more"],
+                "returned": len(result["chunks"])
+            }
+        }
 
     except Exception as e:
         logger.exception(f"Ошибка получения чанков: {e}")
