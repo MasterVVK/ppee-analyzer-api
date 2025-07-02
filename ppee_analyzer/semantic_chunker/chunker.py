@@ -19,7 +19,8 @@ from .utils import (
     identify_content_type,
     extract_section_info,
     generate_unique_id,
-    decode_unicode_escapes  # Импорт функции декодирования
+    decode_unicode_escapes,  # Импорт функции декодирования
+    fix_superscript_units   # Импорт функции исправления надстрочных символов
 )
 
 # Импорты для интеграции с ppee_analyzer
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 class SemanticChunker:
     """Класс для семантического разделения документов с использованием docling"""
 
-    def __init__(self, use_gpu: bool = None, threads: int = 16, ocr_languages: List[str] = None):
+    def __init__(self, use_gpu: bool = None, threads: int = 24, ocr_languages: List[str] = None):
         """
         Инициализирует чанкер для семантического разделения документов.
 
@@ -125,17 +126,17 @@ class SemanticChunker:
             logger.info("Распознавание формул ВКЛЮЧЕНО (для химических формул в ППЭЭ)")
 
             # Отключаем ненужное для ППЭЭ
-            #pipeline_options.do_code_enrichment = False  # В ППЭЭ нет кода
-            #pipeline_options.do_picture_classification = False  # Не критично
-            #pipeline_options.do_picture_description = False  # Слишком медленно
+            pipeline_options.do_code_enrichment = False  # В ППЭЭ нет кода
+            pipeline_options.do_picture_classification = False  # Не критично
+            pipeline_options.do_picture_description = False  # Слишком медленно
 
             # Отключаем генерацию изображений для скорости
-            #pipeline_options.generate_page_images = False
-            #pipeline_options.generate_picture_images = False
-            #pipeline_options.generate_table_images = False
+            pipeline_options.generate_page_images = False
+            pipeline_options.generate_picture_images = False
+            pipeline_options.generate_table_images = False
 
             # Дополнительные настройки
-            #pipeline_options.force_backend_text = False
+            pipeline_options.force_backend_text = False
 
             # Настраиваем конвертер Docling
             self._converter = DocumentConverter(
@@ -152,6 +153,27 @@ class SemanticChunker:
                        f"OCR={self.ocr_languages}, формулы=ВКЛ, таблицы=ACCURATE")
 
         return self._converter
+
+    def _process_text_content(self, text: str) -> str:
+        """
+        Обрабатывает текстовое содержимое: декодирует Unicode и исправляет надстрочные символы.
+
+        Args:
+            text: Исходный текст
+
+        Returns:
+            str: Обработанный текст
+        """
+        if not text:
+            return text
+
+        # Сначала декодируем Unicode escapes
+        text = decode_unicode_escapes(text)
+
+        # Затем исправляем надстрочные символы
+        #text = fix_superscript_units(text)
+
+        return text
 
     def extract_chunks(self, pdf_path: str) -> List[Dict]:
         """
@@ -203,8 +225,8 @@ class SemanticChunker:
             # Проверяем, есть ли у элемента атрибут label
             if not hasattr(element, 'label'):
                 if hasattr(element, 'text') and element.text.strip():
-                    # Декодируем Unicode escapes
-                    decoded_text = decode_unicode_escapes(element.text)
+                    # Обрабатываем текст
+                    decoded_text = self._process_text_content(element.text)
 
                     if current_chunk["content"]:
                         # Преобразуем set в sorted list перед добавлением
@@ -234,7 +256,7 @@ class SemanticChunker:
                         chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
                     chunks.append(chunk_to_add)
 
-                last_caption = decode_unicode_escapes(element.text) if hasattr(element, 'text') else str(element)
+                last_caption = self._process_text_content(element.text) if hasattr(element, 'text') else str(element)
                 current_chunk = {
                     "content": "",
                     "type": None,
@@ -252,22 +274,22 @@ class SemanticChunker:
                 table_content = ""
                 try:
                     table_content = element.export_to_markdown(doc=document)
-                    table_content = decode_unicode_escapes(table_content)
+                    table_content = self._process_text_content(table_content)
                 except:
                     try:
                         df = element.export_to_dataframe()
                         table_content = df.to_string()
-                        table_content = decode_unicode_escapes(table_content)
+                        table_content = self._process_text_content(table_content)
                     except:
                         table_content = str(element.data) if hasattr(element, 'data') else str(element)
-                        table_content = decode_unicode_escapes(table_content)
+                        table_content = self._process_text_content(table_content)
 
                 # Если есть caption, добавляем его
                 if hasattr(element, 'caption_text'):
                     try:
                         caption = element.caption_text(document)
                         if caption and not last_caption:
-                            last_caption = decode_unicode_escapes(caption)
+                            last_caption = self._process_text_content(caption)
                     except:
                         pass
 
@@ -316,7 +338,7 @@ class SemanticChunker:
 
                 # Начинаем новый чанк с заголовком
                 heading_text = element.text if hasattr(element, 'text') else str(element)
-                heading_text = decode_unicode_escapes(heading_text)
+                heading_text = self._process_text_content(heading_text)
 
                 current_chunk = {
                     "content": heading_text,
@@ -340,11 +362,11 @@ class SemanticChunker:
 
                 content = ""
                 if hasattr(element, 'text'):
-                    content = decode_unicode_escapes(element.text)
+                    content = self._process_text_content(element.text)
                 elif hasattr(element, 'export_to_markdown'):
                     try:
                         content = element.export_to_markdown(doc=document)
-                        content = decode_unicode_escapes(content)
+                        content = self._process_text_content(content)
                     except:
                         content = str(element)
                 else:
@@ -379,13 +401,13 @@ class SemanticChunker:
                             chunk_to_add["all_pages"] = sorted(list(chunk_to_add["all_pages"]))
                         chunks.append(chunk_to_add)
 
-                    last_caption = decode_unicode_escapes(element.text)
+                    last_caption = self._process_text_content(element.text)
                     continue
 
                 # Обычный текст или параграф
                 current_table = None
                 text_content = element.text if hasattr(element, 'text') else str(element)
-                text_content = decode_unicode_escapes(text_content)
+                text_content = self._process_text_content(text_content)
 
                 if current_chunk["type"] == "heading":
                     # Если предыдущий элемент был заголовком, преобразуем в секцию
@@ -432,7 +454,7 @@ class SemanticChunker:
             else:
                 # Для всех остальных типов элементов
                 if hasattr(element, 'text') and element.text.strip():
-                    decoded_text = decode_unicode_escapes(element.text)
+                    decoded_text = self._process_text_content(element.text)
 
                     if current_chunk["content"]:
                         chunk_to_add = current_chunk.copy()
