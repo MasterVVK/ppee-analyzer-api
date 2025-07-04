@@ -322,6 +322,10 @@ def extract_value_from_response(response_data: Any, query: str) -> str:
 
     lines = [line.strip() for line in response.split('\n') if line.strip()]
 
+    # Если нет строк - это ошибка обработки, не ответ LLM
+    if not lines:
+        return "ОШИБКА: Пустой ответ от LLM"
+
     # Ищем строку с результатом
     for line in lines:
         if line.startswith("РЕЗУЛЬТАТ:"):
@@ -334,9 +338,8 @@ def extract_value_from_response(response_data: Any, query: str) -> str:
             if len(parts) == 2 and parts[1].strip():
                 return parts[1].strip()
 
-    # Возвращаем последнюю строку
-    return lines[-1] if lines else "Информация не найдена"
-
+    # Возвращаем последнюю строку - что бы там ни было от LLM
+    return lines[-1]
 
 def calculate_confidence(response_data: Any) -> float:
     """Рассчитывает уверенность в ответе"""
@@ -1125,26 +1128,31 @@ async def analyze_application_task_worker(request: AnalyzeApplicationRequest):
                     logger.info(f"Сохранены промежуточные результаты в Redis: {len(results)} параметров")
 
                 else:
+                    # Четко указываем причину
+                    error_message = f"ОШИБКА ПОИСКА: Не найдено документов по запросу '{query}' (метод: {search_method})"
+
                     results.append({
                         "parameter_id": item['id'],
-                        "value": "Информация не найдена",
+                        "value": error_message,
                         "confidence": 0.0,
+                        "error_type": "search_failed",
                         "search_results": [],
                         "search_method": search_method,
                         "llm_request": {
-                            'error': 'Не найдено результатов поиска',
+                            'error': f'Поиск не вернул результатов для запроса: {query}',
                             'search_method': search_method,
                             'model': item['llm_model'],
                             'search_query': query,
+                            'prompt_template': item['llm_prompt_template'],
+                            'prompt_tokens': 0,
+                            'completion_tokens': 0,
+                            'total_tokens': 0,
                             # Добавляем пустую информацию о токенах для консистентности
                             'tokens': {
                                 'prompt_tokens': 0,
                                 'completion_tokens': 0,
                                 'total_tokens': 0
-                            },
-                            'prompt_tokens': 0,
-                            'completion_tokens': 0,
-                            'total_tokens': 0
+                            }
                         }
                     })
 

@@ -207,8 +207,9 @@ class ChecklistAnalyzer:
             # Пропускаем пункты с ошибками
             if 'error' in item_results:
                 extracted_data[item_id] = {
-                    'value': f"Ошибка: {item_results['error']}",
-                    'source': None
+                    'value': f"ОШИБКА: {item_results['error']}",
+                    'source': None,
+                    'error_type': 'search_error'
                 }
                 continue
 
@@ -217,8 +218,9 @@ class ChecklistAnalyzer:
 
             if not documents:
                 extracted_data[item_id] = {
-                    'value': "Информация не найдена",
-                    'source': None
+                    'value': f"ОШИБКА: Нет результатов поиска для пункта {item_id}",
+                    'source': None,
+                    'error_type': 'no_search_results'
                 }
                 continue
 

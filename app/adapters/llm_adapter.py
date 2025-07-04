@@ -524,7 +524,7 @@ class OllamaLLMProvider(LLMProvider):
                 # Если после очистки ответ пустой, возвращаем строку о проблеме
                 if not cleaned_answer:
                     logger.warning("После удаления блоков <think> ответ стал пустым")
-                    cleaned_answer = "Информация не найдена"
+                    cleaned_answer = "ОШИБКА LLM: Модель вернула только блоки размышлений без финального ответа"
 
                 answer = cleaned_answer
             else:
