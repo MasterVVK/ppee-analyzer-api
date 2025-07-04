@@ -21,7 +21,7 @@ from ppee_analyzer.vector_store import QdrantManager, BGEReranker, OllamaEmbeddi
 from ppee_analyzer.semantic_chunker import SemanticChunker
 from langchain_core.documents import Document
 
-# Импорты из локальных адаптеров
+# Импорт локальных адаптеров
 from app.adapters.llm_adapter import OllamaLLMProvider
 
 # Настройка логирования
@@ -36,7 +36,7 @@ executor = ThreadPoolExecutor(max_workers=30)
 reranker_semaphore = None
 reranker_initialized = False  # Флаг инициализации ререйтера
 active_indexing_tasks = 0  # Счетчик активных задач индексации
-indexing_lock = None  # Блокировка для счетчика
+indexing_lock = None  # Локировка для счетчика
 indexing_queue = None  # Очередь для задач индексации
 indexing_semaphore = None  # Семафор для ограничения одной индексации
 
@@ -311,8 +311,15 @@ def get_document_key(doc: Dict) -> str:
 
 
 # Вспомогательные функции для анализа
-def extract_value_from_response(response: str, query: str) -> str:
+def extract_value_from_response(response_data: Any, query: str) -> str:
     """Извлекает значение из ответа LLM"""
+    # Если response_data - это словарь с полной информацией
+    if isinstance(response_data, dict) and "response" in response_data:
+        response = response_data["response"]
+    else:
+        # Обратная совместимость - если это просто строка
+        response = str(response_data)
+
     lines = [line.strip() for line in response.split('\n') if line.strip()]
 
     # Ищем строку с результатом
@@ -331,8 +338,14 @@ def extract_value_from_response(response: str, query: str) -> str:
     return lines[-1] if lines else "Информация не найдена"
 
 
-def calculate_confidence(response: str) -> float:
+def calculate_confidence(response_data: Any) -> float:
     """Рассчитывает уверенность в ответе"""
+    # Извлекаем текст ответа
+    if isinstance(response_data, dict) and "response" in response_data:
+        response = response_data["response"]
+    else:
+        response = str(response_data)
+
     uncertainty_phrases = [
         "возможно", "вероятно", "может быть", "предположительно",
         "не ясно", "не уверен", "не определено", "информация не найдена"
@@ -479,7 +492,7 @@ async def get_reranker():
                         lambda: BGEReranker(
                             model_name="BAAI/bge-reranker-v2-m3",
                             device="cuda",
-                            batch_size=1,  # ВАЖНО: Используем batch_size=1 для экономии памяти
+                            batch_size=1,  # Используем batch_size=1 для экономии памяти
                             max_length=8192,
                             min_vram_mb=500
                         )
@@ -511,7 +524,8 @@ async def update_task_status(task_id: str, status: str, progress: int = 0,
 
 
 async def process_document_with_semantic_chunker(document_path: str, application_id: str,
-                                                 additional_metadata: Optional[Dict[str, Any]] = None) -> List[Document]:
+                                                 additional_metadata: Optional[Dict[str, Any]] = None) -> List[
+    Document]:
     """Асинхронно обрабатывает документ с использованием семантического чанкера"""
     loop = asyncio.get_event_loop()
 
@@ -569,7 +583,7 @@ async def process_document_with_semantic_chunker(document_path: str, application
                     "content_weight": calculate_content_weight(content_length)  # Новое поле
                 }
 
-                # ВАЖНО: Добавляем дополнительные метаданные (file_id, index_session_id и т.д.)
+                # Добавляем дополнительные метаданные (file_id, index_session_id и т.д.)
                 if additional_metadata:
                     metadata.update(additional_metadata)
 
@@ -733,7 +747,7 @@ async def index_document_task_worker(request: IndexDocumentRequest):
             request.metadata  # Передаем дополнительные метаданные
         )
 
-        # ИСПРАВЛЕНО: Добавляем этап "split" после обработки
+        # НОВОЕ: Добавляем этап "split" после обработки
         await update_task_status(request.task_id, "PROGRESS", 30, "split", f"Разделение на {len(chunks)} фрагментов...")
 
         # Удаляем старые данные если нужно
@@ -780,12 +794,12 @@ async def index_document_task_worker(request: IndexDocumentRequest):
                             points_selector=models.PointIdsList(points=points_to_delete)
                         )
                     )
-                    logger.info(f"Удалено {len(points_to_delete)} старых чанков файла")
+                    logger.info(f"Удалено {len(points_to_delete)} старые чанков файла")
             else:
                 # Старый способ - удаляем все данные заявки
                 await loop.run_in_executor(executor, qdrant_manager.delete_application, request.application_id)
 
-        # ИСПРАВЛЕНО: Обновляем прогресс перед индексацией
+        # НОВОЕ: Обновляем прогресс перед индексацией
         await update_task_status(request.task_id, "PROGRESS", 50, "index", f"Индексация {len(chunks)} фрагментов...")
 
         # Индексируем пакетами асинхронно
@@ -800,7 +814,7 @@ async def index_document_task_worker(request: IndexDocumentRequest):
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(executor, qdrant_manager.add_documents, batch)
 
-            # ИСПРАВЛЕНО: Корректируем расчет прогресса и этапа
+            # НОВОЕ: Корректируем расчет прогресса и этапа
             progress = 50 + int(40 * (end_idx / total_chunks))  # От 50% до 90%
 
             # Определяем этап в зависимости от прогресса
@@ -812,7 +826,7 @@ async def index_document_task_worker(request: IndexDocumentRequest):
             await update_task_status(request.task_id, "PROGRESS", progress, stage,
                                      f"Индексация: {end_idx}/{total_chunks}...")
 
-        # ИСПРАВЛЕНО: Финальное обновление
+        # НОВОЕ: Финальное обновление
         await update_task_status(request.task_id, "PROGRESS", 95, "complete", "Завершение индексации...")
 
         # Успешное завершение
@@ -911,10 +925,20 @@ async def _process_llm_request(task_data: dict):
                 query=request.query
             )
 
-        response = await loop.run_in_executor(executor, _process)
+        # Получаем полный ответ с информацией о токенах
+        llm_result = await loop.run_in_executor(executor, _process)
 
-        # Устанавливаем результат
-        future.set_result({"status": "success", "response": response})
+        # Устанавливаем результат с полной информацией
+        future.set_result({
+            "status": "success",
+            "response": llm_result.get("response", ""),
+            "tokens": {
+                "prompt_tokens": llm_result.get("prompt_tokens", 0),
+                "completion_tokens": llm_result.get("completion_tokens", 0),
+                "total_tokens": llm_result.get("total_tokens", 0)
+            },
+            "model": llm_result.get("model", request.model_name)
+        })
 
     except Exception as e:
         # Устанавливаем исключение
@@ -923,12 +947,12 @@ async def _process_llm_request(task_data: dict):
 
 async def process_llm_query_async(model_name: str, prompt: str, context: str,
                                   parameters: Dict[str, Any], query: Optional[str] = None):
-    """Асинхронная обработка запроса через LLM"""
+    """Асинхронная обработка запроса через LLM с возвратом информации о токенах"""
     loop = asyncio.get_event_loop()
 
     def _process():
         llm_provider = OllamaLLMProvider(base_url="http://localhost:11434")
-
+        # Теперь возвращаем полный ответ с информацией о токенах
         return llm_provider.process_query(
             model_name=model_name,
             prompt=prompt,
@@ -1038,7 +1062,8 @@ async def analyze_application_task_worker(request: AnalyzeApplicationRequest):
 
                     # Вызываем LLM асинхронно с полным промптом
                     async with analysis_llm_semaphore:
-                        llm_response = await process_llm_query_async(
+                        # Теперь получаем полный ответ с информацией о токенах
+                        llm_result = await process_llm_query_async(
                             item['llm_model'],
                             full_prompt,  # Передаем полный промпт
                             "",  # Контекст уже включен в промпт
@@ -1050,7 +1075,15 @@ async def analyze_application_task_worker(request: AnalyzeApplicationRequest):
                             query
                         )
 
-                    # Извлекаем значение
+                    # Теперь llm_result - это словарь с полной информацией
+                    llm_response = llm_result.get("response", "")
+                    tokens_info = {
+                        "prompt_tokens": llm_result.get("prompt_tokens", 0),
+                        "completion_tokens": llm_result.get("completion_tokens", 0),
+                        "total_tokens": llm_result.get("total_tokens", 0)
+                    }
+
+                    # Извлекаем значение из текста ответа (передаем только текст)
                     value = extract_value_from_response(llm_response, query)
                     confidence = calculate_confidence(llm_response)
 
@@ -1073,12 +1106,17 @@ async def analyze_application_task_worker(request: AnalyzeApplicationRequest):
                             'response': llm_response,  # Полный ответ LLM
                             'search_query': query,
                             'search_method': search_method,
-                            'context': context  # Можно сохранить и контекст для отладки
+                            'context': context,  # Можно сохранить и контекст для отладки
+                            # НОВОЕ: Добавляем информацию о токенах
+                            'tokens': tokens_info,
+                            'prompt_tokens': tokens_info['prompt_tokens'],
+                            'completion_tokens': tokens_info['completion_tokens'],
+                            'total_tokens': tokens_info['total_tokens']
                         }
                     })
                     processed_count += 1
 
-                    # ВАЖНО: Сохраняем промежуточные результаты в Redis после каждого параметра
+                    # НОВОЕ: Сохраняем промежуточные результаты в Redis после каждого параметра
                     await redis_client.setex(
                         f"task_results:{request.task_id}",
                         3600,  # TTL 1 час
@@ -1097,7 +1135,16 @@ async def analyze_application_task_worker(request: AnalyzeApplicationRequest):
                             'error': 'Не найдено результатов поиска',
                             'search_method': search_method,
                             'model': item['llm_model'],
-                            'search_query': query
+                            'search_query': query,
+                            # Добавляем пустую информацию о токенах для консистентности
+                            'tokens': {
+                                'prompt_tokens': 0,
+                                'completion_tokens': 0,
+                                'total_tokens': 0
+                            },
+                            'prompt_tokens': 0,
+                            'completion_tokens': 0,
+                            'total_tokens': 0
                         }
                     })
 
@@ -1115,7 +1162,12 @@ async def analyze_application_task_worker(request: AnalyzeApplicationRequest):
                     "search_results": [],
                     "llm_request": {
                         'error': str(e),
-                        'model': item.get('llm_model', 'unknown')
+                        'model': item.get('llm_model', 'unknown'),
+                        'tokens': {
+                            'prompt_tokens': 0,
+                            'completion_tokens': 0,
+                            'total_tokens': 0
+                        }
                     }
                 })
 
@@ -1151,7 +1203,7 @@ async def analyze_application_task_worker(request: AnalyzeApplicationRequest):
             active_analysis_tasks -= 1
             logger.info(f"Анализ завершен. Активных анализов: {active_analysis_tasks}")
 
-        # Очистка GPU
+        # Чистка GPU
         cleanup_gpu_memory()
 
 
@@ -1201,7 +1253,7 @@ async def lifespan(app: FastAPI):
     )
     logger.info("QdrantManager инициализирован")
 
-    # СОЗДАНИЕ КОЛЛЕКЦИИ
+    # НОВОЕ: Проверка и создание коллекции Qdrant
     logger.info("Проверка и создание коллекции Qdrant...")
     try:
         # Получаем список существующих коллекций
@@ -1311,7 +1363,8 @@ async def lifespan(app: FastAPI):
 
                 # Проверяем наличие полнотекстового индекса
                 if hasattr(collection_info, 'payload_schema'):
-                    existing_indices = set(collection_info.payload_schema.keys()) if collection_info.payload_schema else set()
+                    existing_indices = set(
+                        collection_info.payload_schema.keys()) if collection_info.payload_schema else set()
 
                     # Создаем недостающие индексы
                     for field_name, field_schema in required_indices.items():
@@ -1618,7 +1671,7 @@ async def analyze_application(request: AnalyzeApplicationRequest):
     # Обновляем статус задачи
     queue_position = analysis_queue.qsize()
     await update_task_status(request.task_id, "QUEUED", 0, "queue",
-                           f"Задача добавлена в очередь анализа. Позиция: {queue_position}")
+                             f"Задача добавлена в очередь анализа. Позиция: {queue_position}")
 
     return {
         "status": "queued",
@@ -1629,7 +1682,7 @@ async def analyze_application(request: AnalyzeApplicationRequest):
 
 @app.post("/llm/process")
 async def process_llm_query(request: ProcessQueryRequest):
-    """Асинхронно обрабатывает запрос через LLM с контролем нагрузки"""
+    """Асинхронно обрабатывает запрос через LLM с контролем нагрузки и возвратом токенов"""
     # Создаем уникальный ID для задачи
     task_id = str(uuid.uuid4())
 
@@ -1651,7 +1704,20 @@ async def process_llm_query(request: ProcessQueryRequest):
     try:
         # Ждем результат
         result = await future
-        return result
+
+        # Теперь результат содержит информацию о токенах
+        # Формируем финальный ответ
+        return {
+            "status": result.get("status", "success"),
+            "response": result.get("response", ""),
+            "tokens": result.get("tokens", {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }),
+            "model": result.get("model", request.model_name)
+        }
+
     except Exception as e:
         logger.exception(f"Ошибка LLM: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2016,7 +2082,7 @@ async def get_task_results(task_id: str):
 
     data = json.loads(task_data)
 
-    # ИЗМЕНЕНО: Проверяем статус, но разрешаем PROGRESS для промежуточных результатов
+    # НОВОЕ: Проверяем статус, но разрешаем PROGRESS для промежуточных результатов
     status = data.get("status")
     if status not in ["SUCCESS", "PROGRESS"]:
         # Для обратной совместимости возвращаем ошибку 400 для других статусов
@@ -2245,8 +2311,8 @@ async def get_system_stats():
             "gpu": {"name": "Ошибка", "vram_percent": 0, "vram_used_gb": 0,
                     "vram_total_gb": 0, "temperature": None, "utilization": 0},
             "system": {"process_count": 0, "disk_percent": 0,
-                      "active_indexing_tasks": 0,
-                      "indexing_queue_size": 0}
+                       "active_indexing_tasks": 0,
+                       "indexing_queue_size": 0}
         }
 
 

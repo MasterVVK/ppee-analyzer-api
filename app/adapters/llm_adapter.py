@@ -3,7 +3,7 @@ import requests
 import json
 import re
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ class LLMProvider(ABC):
                       prompt: str,
                       context: str,
                       parameters: Dict[str, Any],
-                      query: str = None) -> str:
+                      query: str = None) -> Union[str, Dict[str, Any]]:
         """Обрабатывает запрос к LLM"""
         pass
 
@@ -91,7 +91,7 @@ class OllamaLLMProvider(LLMProvider):
                 timeout=5
             )
 
-            # Если POST не работает, попробуем другие методы
+            # Если POST не работает, пробуем другие методы
             if response.status_code != 200:
                 logger.info(f"POST запрос не сработал, пробуем другие варианты для {model_name}")
 
@@ -365,9 +365,9 @@ class OllamaLLMProvider(LLMProvider):
                       prompt: str,
                       context: str,
                       parameters: Dict[str, Any],
-                      query: str = None) -> str:
+                      query: str = None) -> Dict[str, Any]:
         """
-        Обрабатывает запрос к LLM через Ollama API.
+        Обрабатывает запрос к LLM через Ollama API и возвращает ответ с информацией о токенах.
 
         Args:
             model_name: Название модели
@@ -377,7 +377,16 @@ class OllamaLLMProvider(LLMProvider):
             query: Поисковый запрос (если нужно заменить {query} в шаблоне)
 
         Returns:
-            str: Ответ модели
+            Dict[str, Any]: Словарь с ответом и информацией о токенах:
+                - response: str - текст ответа
+                - prompt_tokens: int - количество токенов в запросе
+                - completion_tokens: int - количество токенов в ответе
+                - total_tokens: int - общее количество токенов
+                - model: str - использованная модель
+                - total_duration: int - общее время выполнения в наносекундах
+                - load_duration: int - время загрузки модели в наносекундах
+                - prompt_eval_duration: int - время обработки промпта в наносекундах
+                - eval_duration: int - время генерации ответа в наносекундах
         """
         try:
             # Создаем полный промпт, заменяя плейсхолдеры
@@ -405,7 +414,6 @@ class OllamaLLMProvider(LLMProvider):
 
             # Получаем максимальный размер контекста для модели
             model_max_context = self.get_context_length(model_name)
-            # Убрано искусственное ограничение в 16384 токена
 
             # Используем меньшее из двух значений
             actual_context_size = min(required_context, model_max_context)
@@ -454,7 +462,7 @@ class OllamaLLMProvider(LLMProvider):
             response = requests.post(
                 f"{self.base_url}/api/generate",
                 json=payload,
-                timeout=2300  # Увеличенный таймаут для сложных запросов
+                timeout=2400  # Увеличенный таймаут для сложных запросов
             )
 
             # Проверяем ответ
@@ -467,7 +475,14 @@ class OllamaLLMProvider(LLMProvider):
                         error_msg += f" - {error_json['error']}"
                 except:
                     pass
-                return f"Ошибка сети: {error_msg}"
+                return {
+                    "response": f"Ошибка сети: {error_msg}",
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "model": model_name,
+                    "error": True
+                }
 
             # Получаем ответ
             result = response.json()
@@ -476,9 +491,18 @@ class OllamaLLMProvider(LLMProvider):
             if "error" in result:
                 error_msg = f"Ошибка Ollama API: {result.get('error')}"
                 logger.error(error_msg)
-                return f"Ошибка: {error_msg}"
+                return {
+                    "response": f"Ошибка: {error_msg}",
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "model": model_name,
+                    "error": True
+                }
 
+            # Извлекаем основной ответ
             answer = result.get("response", "")
+
             # Удаляем служебные токены Gemma
             answer = answer.replace("</start_of_turn>", "")
             answer = answer.replace("</end_of_turn>", "")
@@ -500,34 +524,65 @@ class OllamaLLMProvider(LLMProvider):
                 # Если после очистки ответ пустой, возвращаем строку о проблеме
                 if not cleaned_answer:
                     logger.warning("После удаления блоков <think> ответ стал пустым")
-                    return "Информация не найдена"
+                    cleaned_answer = "Информация не найдена"
 
                 answer = cleaned_answer
             else:
                 logger.info("Блоки <think> не обнаружены в ответе модели")
 
-            # Выводим информацию о загрузке и генерации
+            # Извлекаем информацию о токенах и времени выполнения
+            prompt_tokens = result.get('prompt_eval_count', 0)
+            completion_tokens = result.get('eval_count', 0)
+            total_tokens = prompt_tokens + completion_tokens
+
             total_duration = result.get('total_duration', 0)
             load_duration = result.get('load_duration', 0)
-            prompt_eval_count = result.get('prompt_eval_count', 0)
-            eval_count = result.get('eval_count', 0)
+            prompt_eval_duration = result.get('prompt_eval_duration', 0)
+            eval_duration = result.get('eval_duration', 0)
 
-            # Выводим полный ответ модели для отладки
+            # Выводим информацию о генерации
             logger.info(f"Итоговый ответ от модели {model_name} длиной {len(answer)} символов")
-            logger.info(f"Статистика генерации: prompt_tokens={prompt_eval_count}, output_tokens={eval_count}")
+            logger.info(
+                f"Статистика генерации: prompt_tokens={prompt_tokens}, output_tokens={completion_tokens}, total_tokens={total_tokens}")
 
             if total_duration > 0:
                 total_seconds = total_duration / 1e9  # Преобразуем наносекунды в секунды
                 logger.info(f"Время выполнения: {total_seconds:.2f} сек (загрузка: {load_duration / 1e9:.2f} сек)")
 
-            # Возвращаем обработанный ответ
-            return answer
+            # Формируем полный ответ с информацией о токенах
+            return {
+                "response": answer,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "model": model_name,
+                "done": result.get('done', True),
+                "context": result.get('context', []),  # Контекст для следующих запросов
+                "total_duration": total_duration,  # Время выполнения в наносекундах
+                "load_duration": load_duration,
+                "prompt_eval_duration": prompt_eval_duration,
+                "eval_duration": eval_duration
+            }
 
         except requests.exceptions.RequestException as e:
             error_msg = f"Ошибка HTTP при запросе к Ollama API: {str(e)}"
             logger.error(error_msg)
-            return f"Ошибка сети: {error_msg}"
+            return {
+                "response": f"Ошибка сети: {error_msg}",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "model": model_name,
+                "error": True
+            }
         except Exception as e:
             error_msg = f"Ошибка при обработке запроса через Ollama API: {str(e)}"
             logger.error(error_msg)
-            return f"Ошибка: {error_msg}"
+            return {
+                "response": f"Ошибка: {error_msg}",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "model": model_name,
+                "error": True
+            }
