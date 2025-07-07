@@ -1749,6 +1749,168 @@ async def get_llm_models():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Замените существующие endpoints в FastAPI main.py на эти исправленные версии
+
+@app.get("/llm/models/info")
+async def get_llm_models_info():
+    """Получает информацию о всех моделях от Ollama с извлечением размера контекста"""
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _get_models():
+            import requests
+            import re
+
+            # Получаем список моделей от Ollama
+            response = requests.get("http://localhost:11434/api/tags")
+            response.raise_for_status()
+
+            data = response.json()
+            models_info = {}
+
+            # Обрабатываем каждую модель
+            for model in data.get("models", []):
+                model_name = model.get("name", "")
+
+                # Пропускаем embedding модели
+                if "bge-m3" in model_name.lower() or "embedding" in model_name.lower():
+                    continue
+
+                # Собираем базовую информацию
+                details = model.get("details", {})
+                model_info_dict = {
+                    "name": model_name,
+                    "parameter_size": details.get("parameter_size", "Неизвестно"),
+                    "context_length": 8192,  # Значение по умолчанию
+                    "family": details.get("family", "Неизвестно"),
+                    "quantization": details.get("quantization_level", "Неизвестно"),
+                    "format": details.get("format", "gguf"),
+                    "size": model.get("size", 0),
+                    "size_gb": round(model.get("size", 0) / (1024 ** 3), 2),
+                    "modified_at": model.get("modified_at", ""),
+                    "digest": model.get("digest", "")
+                }
+
+                # Пытаемся получить детальную информацию через /api/show
+                try:
+                    show_response = requests.post(
+                        "http://localhost:11434/api/show",
+                        json={"name": model_name},
+                        timeout=5  # Таймаут чтобы не висело
+                    )
+
+                    if show_response.status_code == 200:
+                        show_data = show_response.json()
+                        model_info = show_data.get("model_info", {})
+
+                        # Ищем context_length в model_info
+                        context_found = False
+                        for key, value in model_info.items():
+                            if "context_length" in key.lower() and isinstance(value, (int, float)):
+                                model_info_dict["context_length"] = int(value)
+                                context_found = True
+                                logger.info(f"Найден context_length для {model_name} в {key}: {value}")
+                                break
+
+                        # Если не нашли в model_info, ищем в параметрах
+                        if not context_found:
+                            parameters = show_data.get("parameters", "")
+                            modelfile = show_data.get("modelfile", "")
+
+                            # Объединяем для поиска num_ctx
+                            combined_text = f"{parameters}\n{modelfile}"
+
+                            # Ищем num_ctx или num_context
+                            match = re.search(r'(?:num_ctx|num_context)\s+(\d+)', combined_text, re.IGNORECASE)
+                            if match:
+                                model_info_dict["context_length"] = int(match.group(1))
+                                logger.info(f"Найден num_ctx для {model_name}: {match.group(1)}")
+                            else:
+                                # Пробуем найти PARAMETER num_ctx в modelfile
+                                match = re.search(r'PARAMETER\s+num_ctx\s+(\d+)', modelfile)
+                                if match:
+                                    model_info_dict["context_length"] = int(match.group(1))
+                                    logger.info(f"Найден PARAMETER num_ctx для {model_name}: {match.group(1)}")
+
+                except Exception as e:
+                    logger.warning(f"Не удалось получить детали для {model_name}: {e}")
+
+                models_info[model_name] = model_info_dict
+
+            return {"status": "success", "models": models_info}
+
+        result = await loop.run_in_executor(executor, _get_models)
+        return result
+
+    except Exception as e:
+        logger.exception(f"Ошибка получения информации о моделях: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/llm/model/show")
+async def show_llm_model(model_name: str):
+    """Получает детальную информацию о модели от Ollama"""
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _show_model():
+            import requests
+            import re
+
+            response = requests.post(
+                "http://localhost:11434/api/show",
+                json={"name": model_name}
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            model_info = data.get("model_info", {})
+
+            # Извлекаем размер контекста
+            context_length = 8192
+
+            # Метод 1: Ищем в model_info
+            for key, value in model_info.items():
+                if "context_length" in key.lower() and isinstance(value, (int, float)):
+                    context_length = int(value)
+                    break
+
+            # Метод 2: Если не нашли, ищем в параметрах
+            if context_length == 8192:
+                parameters = data.get("parameters", "")
+                modelfile = data.get("modelfile", "")
+
+                combined = f"{parameters}\n{modelfile}"
+
+                # Ищем разные варианты
+                patterns = [
+                    r'(?:num_ctx|num_context)\s+(\d+)',
+                    r'PARAMETER\s+num_ctx\s+(\d+)',
+                    r'"num_ctx":\s*(\d+)',
+                    r'--ctx-size\s+(\d+)'
+                ]
+
+                for pattern in patterns:
+                    match = re.search(pattern, combined, re.IGNORECASE)
+                    if match:
+                        context_length = int(match.group(1))
+                        break
+
+            # Добавляем context_length к ответу
+            data["context_length"] = context_length
+
+            # Логируем для отладки
+            logger.info(f"Модель {model_name}: context_length = {context_length}")
+
+            return data
+
+        result = await loop.run_in_executor(executor, _show_model)
+        return result
+
+    except Exception as e:
+        logger.exception(f"Ошибка получения информации о модели {model_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/applications/{application_id}/stats")
 async def get_application_stats(application_id: str):
     """Асинхронно получает статистику по заявке"""
